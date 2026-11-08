@@ -181,6 +181,7 @@ static const isapnp_device_config_t gameport_pnp_defaults[] = {
 };
 
 const device_t *standalone_gameport_type;
+int             gameport_card_provides_port = 0; /* A card maps its own port on demand. */
 int             gameport_instance_id = 0;
 /* Linked list of active game ports. Only the top port responds to reads
    or writes, and ports at the standard 200h location are prioritized. */
@@ -343,8 +344,9 @@ void
 gameport_update_joystick_type(uint8_t gp)
 {
     /* Add a standalone game port if a joystick is enabled but no other game ports exist. */
-    if (standalone_gameport_type)
+    if (standalone_gameport_type && !gameport_card_provides_port)
         gameport_add(standalone_gameport_type);
+    gameport_card_provides_port = 0;
 
     /* Reset the joystick interface. */
     if (joystick_instance[gp]) {

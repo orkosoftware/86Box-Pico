@@ -37,7 +37,8 @@
  *          folder), and floppy/hard disk images served from the
  *          "<VM folder>/picomem/{FLOPPY,HDD}" folders through Int13h.
  *          Lo-tech compatible EMS (up to 4MB) from the PSRAM.
- *          Not yet: mouse, NE2000, audio, RTC, EtherDFS.
+ *          USB mouse, MM58167 clock and game port.
+ *          Not yet: NE2000, audio, EtherDFS.
  *
  * Authors: Freddy VETELE (original PicoMEM hardware, firmware and BIOS)
  *
@@ -58,11 +59,13 @@
 #include <86box/nvr.h>
 #include <86box/pic.h>
 #include <86box/mouse.h>
+#include <86box/gameport.h>
 #include <86box/plat.h>
 #include <86box/plat_dir.h>
 #include <86box/path.h>
 #include <86box/picomem.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* Logging is on while the emulation is being developed. */
 #ifndef ENABLE_PICOMEM_LOG
@@ -209,6 +212,21 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define IRQ_R_MOUSE  3
 #define BV_USBDevice 10
 
+/* MM58167 clock registers, as wired on the AST SixPakPlus. */
+#define PM_RTC_PORT  0x2c0
+#define PM_RTC_SIZE  16
+#define RTC_MS       0x00
+#define RTC_HS       0x01
+#define RTC_SECONDS  0x02
+#define RTC_MINUTES  0x03
+#define RTC_HOURS    0x04
+#define RTC_DOTW     0x05
+#define RTC_DAY      0x06
+#define RTC_MONTH    0x07
+#define RTC_RAM_MS   0x08
+#define RTC_YEAR     0x0a
+#define RTC_RAM_WEEK 0x0d
+
 /* Offsets inside the PMCFG_t config table. */
 #define CFG_FDD          0  /* 2 x {u16 size; char name[14]} */
 #define CFG_HDD          32 /* 4 x {u16 size; char name[14]} */
@@ -221,6 +239,8 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define CFG_PSRAM_EXT    205
 #define CFG_ENABLE_USB   210
 #define CFG_ENABLE_WIFI  214
+#define CFG_ENABLE_JOY   218
+#define CFG_USE_RTC      241
 #define CFG_NE2000_PORT  216
 #define CFG_B_MAX_PMRAM  220
 #define CFG_PREBOOT      222
@@ -350,6 +370,12 @@ typedef struct picomem_t {
     int     mouse_enabled; /* set by PMMOUSE via CMD_Mouse_Enable */
     int     pm_irq_raised; /* PicoMEM IRQ line currently asserted */
     uint8_t mouse_b;       /* last buttons sent */
+
+    /* Real-time clock and joystick, switched by CMD_DEV_Init. */
+    int     rtc_active;
+    int64_t rtc_offset;              /* guest time minus host time, seconds */
+    uint8_t rtc_ram[PM_RTC_SIZE];
+    void   *gameport;
 } picomem_t;
 
 /* The card that receives host mouse input, if the PicoMEM mouse is selected. */
@@ -913,6 +939,133 @@ static int
 pm_mouse_selected(void)
 {
     return mouse_get_device(mouse_type) == &mouse_picomem_device;
+}
+
+/* ---------- MM58167 real-time clock (dev_rtc.cpp) ---------- */
+
+static struct tm *
+pm_rtc_now(picomem_t *dev, long *nsec)
+{
+    struct timespec ts;
+    time_t          t;
+
+    timespec_get(&ts, TIME_UTC);
+    *nsec = ts.tv_nsec;
+    t     = ts.tv_sec + (time_t) dev->rtc_offset;
+    return localtime(&t);
+}
+
+static uint8_t
+pm_bcd(int v)
+{
+    return (uint8_t) (((v / 10) << 4) | (v % 10));
+}
+
+static int
+pm_unbcd(uint8_t v)
+{
+    return ((v >> 4) * 10) + (v & 0x0f);
+}
+
+static uint8_t
+pm_rtc_read(uint16_t port, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+    int        reg = port & (PM_RTC_SIZE - 1);
+    long       ns;
+    struct tm *t = pm_rtc_now(dev, &ns);
+
+    switch (reg) {
+        case RTC_MS:
+            return (uint8_t) (((ns / 1000000) % 10) << 4); /* Low nibble is always 0. */
+        case RTC_HS:
+            return pm_bcd((int) (ns / 10000000));
+        case RTC_SECONDS:
+            return pm_bcd(t->tm_sec);
+        case RTC_MINUTES:
+            return pm_bcd(t->tm_min);
+        case RTC_HOURS:
+            return pm_bcd(t->tm_hour);
+        case RTC_DOTW:
+            return pm_bcd(t->tm_wday + 1);
+        case RTC_DAY:
+            return pm_bcd(t->tm_mday);
+        case RTC_MONTH:
+            return pm_bcd(t->tm_mon + 1);
+        case RTC_YEAR:
+            return (t->tm_year < 80) ? 0 : (uint8_t) (t->tm_year - 80); /* Since 1980 (AST). */
+        default:
+            return dev->rtc_ram[reg];
+    }
+}
+
+static void
+pm_rtc_write(uint16_t port, uint8_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+    int        reg = port & (PM_RTC_SIZE - 1);
+    long       ns;
+    struct tm  was = *pm_rtc_now(dev, &ns);
+    struct tm  now = was;
+
+    switch (reg) {
+        case RTC_SECONDS:
+            now.tm_sec = pm_unbcd(val);
+            break;
+        case RTC_MINUTES:
+            now.tm_min = pm_unbcd(val);
+            break;
+        case RTC_HOURS:
+            now.tm_hour = pm_unbcd(val);
+            break;
+        case RTC_DAY:
+            now.tm_mday = pm_unbcd(val);
+            break;
+        case RTC_MONTH:
+            now.tm_mon = pm_unbcd(val) - 1;
+            break;
+        case RTC_YEAR:
+            now.tm_year = 80 + val;
+            break;
+        case RTC_RAM_MS:
+            val &= 0xf0;
+            break;
+        case RTC_RAM_WEEK:
+            val &= 0x0f;
+            break;
+        default:
+            break;
+    }
+    dev->rtc_ram[reg] = val;
+    dev->rtc_offset += (int64_t) (mktime(&now) - mktime(&was));
+}
+
+static void
+pm_rtc_enable(picomem_t *dev, int on)
+{
+    on = !!on;
+    if (on == dev->rtc_active)
+        return;
+    if (on)
+        io_sethandler(PM_RTC_PORT, PM_RTC_SIZE,
+                      pm_rtc_read, NULL, NULL, pm_rtc_write, NULL, NULL, dev);
+    else
+        io_removehandler(PM_RTC_PORT, PM_RTC_SIZE,
+                         pm_rtc_read, NULL, NULL, pm_rtc_write, NULL, NULL, dev);
+    dev->rtc_active = on;
+    picomem_log("PicoMEM: RTC %s\n", on ? "on" : "off");
+}
+
+/* ---------- Joystick (dev_joystick.cpp) ---------- */
+
+/* The USB pad of the real card is whatever joystick 86Box has configured. */
+static void
+pm_joystick_enable(picomem_t *dev, int on)
+{
+    if (dev->gameport == NULL)
+        return;
+    gameport_remap(dev->gameport, on ? 0x201 : 0);
+    picomem_log("PicoMEM: joystick %s\n", on ? "on" : "off");
 }
 
 /* ---------- Disk images (pm_disk.cpp, dosbox/bios_disk.cpp) ---------- */
@@ -1794,6 +1947,8 @@ pm_exec_cmd(picomem_t *dev)
 
         case CMD_DEV_Init:
             dev->mouse_enabled = 0; /* Enabled later by PMMOUSE. */
+            pm_rtc_enable(dev, pm_cfg(dev)[CFG_USE_RTC]);
+            pm_joystick_enable(dev, pm_cfg(dev)[CFG_ENABLE_JOY]);
             /* TODO: (re)install NE2000, audio, RTC, joystick from config. */
             pm_pc_send(dev, PCC_EndCommand); /* PC_End() */
             break;
@@ -1874,7 +2029,8 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_Joy_OnOff:
-            dev->data_l = 1; /* Error: not available. */
+            pm_joystick_enable(dev, dev->data_l | dev->data_h);
+            dev->data_l = 1; /* As the firmware: true when done. */
             dev->data_h = 0;
             pm_set_status(dev, STAT_READY);
             break;
@@ -2162,6 +2318,13 @@ picomem_init(const device_t *info)
 
     pm_set_status(dev, STAT_READY);
 
+    /* The game port stays unmapped until the setup or PMINIT turns it on. */
+    if (joystick_type[0] != JS_TYPE_NONE) {
+        dev->gameport = gameport_add(&gameport_201_device);
+        gameport_remap(dev->gameport, 0);
+        gameport_card_provides_port = 1;
+    }
+
     if (pm_mouse_selected() && (pm_mouse_card == NULL))
         pm_mouse_card = dev;
 
@@ -2180,6 +2343,7 @@ picomem_close(void *priv)
     for (int i = 0; i < PM_NDISKS; i++)
         pm_disk_close(dev, i);
     pm_ems_remove(dev);
+    pm_rtc_enable(dev, 0);
     if (pm_mouse_card == dev)
         pm_mouse_card = NULL;
     free(dev->pmram);

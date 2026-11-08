@@ -146,6 +146,7 @@ extern const device_t gameport_sio_device;
 extern const device_t gameport_sio_1io_device;
 
 extern const device_t *standalone_gameport_type;
+extern int             gameport_card_provides_port;
 #endif
 extern int                   gameport_instance_id;
 extern plat_joystick_state_t plat_joystick_state[MAX_PLAT_JOYSTICKS];
