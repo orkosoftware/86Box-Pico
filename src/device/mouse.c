@@ -123,6 +123,7 @@ static mouse_t mouse_devices[] = {
     { &mouse_ltserial_device           },
     { &mouse_ps2_device                },
     { &mouse_usb_device                },
+    { &mouse_picomem_device            },
 #ifdef USE_STANDALONE_QUICKPORT
     { &mouse_upc_standalone_device     },
 #endif

@@ -57,6 +57,7 @@
 #include <86box/rom.h>
 #include <86box/nvr.h>
 #include <86box/pic.h>
+#include <86box/mouse.h>
 #include <86box/plat.h>
 #include <86box/plat_dir.h>
 #include <86box/path.h>
@@ -194,6 +195,20 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define PCCR_PMSTATE (PCCMD_OFFS + 2)
 #define PCCR_PARAM   (PCCMD_OFFS + 36)
 
+/* Multiplexed "PicoMEM IRQ" shared variables (pm_irq_svar_t, 14 bytes). */
+#define IRQV_OFFS    (PCCMD_OFFS + 4) /* 854 */
+#define IRQV_IRR     (IRQV_OFFS + 0)  /* IRR_list[6], one per source */
+#define IRQV_ISR     (IRQV_OFFS + 6)  /* u16 */
+#define IRQV_PM_IRR  (IRQV_OFFS + 8)
+#define IRQV_PM_ISR  (IRQV_OFFS + 9)
+#define IRQV_CNT     (IRQV_OFFS + 10)
+#define IRQV_MOUSE_X (IRQV_OFFS + 11)
+#define IRQV_MOUSE_Y (IRQV_OFFS + 12)
+#define IRQV_MOUSE_B (IRQV_OFFS + 13)
+#define IRQV_SIZE    14
+#define IRQ_R_MOUSE  3
+#define BV_USBDevice 10
+
 /* Offsets inside the PMCFG_t config table. */
 #define CFG_FDD          0  /* 2 x {u16 size; char name[14]} */
 #define CFG_HDD          32 /* 4 x {u16 size; char name[14]} */
@@ -330,7 +345,15 @@ typedef struct picomem_t {
     pm_disk_t disks[PM_NDISKS];
     uint8_t   last_status;
     int       kill_read;
+
+    /* USB mouse (host mouse routed through "PicoMEM USB mouse"). */
+    int     mouse_enabled; /* set by PMMOUSE via CMD_Mouse_Enable */
+    int     pm_irq_raised; /* PicoMEM IRQ line currently asserted */
+    uint8_t mouse_b;       /* last buttons sent */
 } picomem_t;
+
+/* The card that receives host mouse input, if the PicoMEM mouse is selected. */
+static picomem_t *pm_mouse_card = NULL;
 
 #ifdef ENABLE_PICOMEM_LOG
 int picomem_do_log = ENABLE_PICOMEM_LOG;
@@ -782,6 +805,114 @@ pm_irq_timer(void *priv)
         default:
             break;
     }
+}
+
+/* ---------- Multiplexed PicoMEM IRQ (isa_irq.cpp) ---------- */
+
+/* The BIOS IRQ handler walks IRR_list[], services each request, then
+   writes CMD_PMIRQ_ACK when its nesting counter drops back to zero. */
+static void
+pm_irq_clear_vars(picomem_t *dev)
+{
+    memset(&dev->ram[IRQV_OFFS], 0x00, IRQV_SIZE);
+    if (dev->pm_irq_raised)
+        picintc(1 << dev->irq);
+    dev->pm_irq_raised = 0;
+}
+
+static void
+pm_pm_irq_raise(picomem_t *dev, int source, uint8_t arg)
+{
+    dev->ram[IRQV_IRR + source] = arg << 1;
+
+    if (!dev->ram[IRQV_PM_IRR]) {
+        /* Not yet requested: (re)assert the line for a fresh edge. */
+        if (dev->pm_irq_raised)
+            picintc(1 << dev->irq);
+        dev->ram[IRQV_PM_IRR] = 1;
+        picint(1 << dev->irq);
+        dev->pm_irq_raised = 1;
+    }
+}
+
+static void
+pm_pm_irq_ack(picomem_t *dev)
+{
+    if (!dev->ram[IRQV_PM_IRR]) {
+        picintc(1 << dev->irq);
+        dev->pm_irq_raised = 0;
+    }
+    dev->ram[IRQV_PM_ISR] = 0;
+}
+
+/* ---------- USB mouse (dev_mouse.cpp, hid_app.c) ---------- */
+
+/* Called by the 86Box mouse timer while "PicoMEM USB mouse" is selected. */
+static int
+pm_mouse_poll(UNUSED(void *priv))
+{
+    picomem_t *dev = pm_mouse_card;
+    int        dx;
+    int        dy;
+    uint8_t    b;
+
+    if ((dev == NULL) || !dev->mouse_enabled) {
+        mouse_clear_coords();
+        return 1;
+    }
+
+    /* Previous event still pending: let movement accumulate. */
+    if (dev->ram[IRQV_IRR + IRQ_R_MOUSE] || dev->ram[IRQV_PM_IRR])
+        return 1;
+
+    b = mouse_get_buttons_ex() & 0x07;
+    if (!mouse_moved() && (b == dev->mouse_b))
+        return 1;
+
+    mouse_subtract_coords(&dx, &dy, NULL, NULL, -128, 127, 0, 0);
+    dev->mouse_b = b;
+    dev->ram[IRQV_MOUSE_X] = (uint8_t) (int8_t) dx;
+    dev->ram[IRQV_MOUSE_Y] = (uint8_t) (int8_t) dy;
+    dev->ram[IRQV_MOUSE_B] = b;
+    pm_pm_irq_raise(dev, IRQ_R_MOUSE, 1);
+
+    return 0;
+}
+
+static int pm_mouse_dummy;
+
+static void *
+pm_mouse_init(UNUSED(const device_t *info))
+{
+    mouse_set_buttons(3);
+    mouse_set_poll(pm_mouse_poll, NULL);
+    return &pm_mouse_dummy;
+}
+
+static void
+pm_mouse_close(UNUSED(void *priv))
+{
+    /* Nothing to free: the state lives in the PicoMEM card. */
+}
+
+const device_t mouse_picomem_device = {
+    .name          = "PicoMEM USB mouse",
+    .internal_name = "picomem",
+    .flags         = 0,
+    .local         = 0,
+    .init          = pm_mouse_init,
+    .close         = pm_mouse_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = NULL
+};
+
+static int
+pm_mouse_selected(void)
+{
+    return mouse_get_device(mouse_type) == &mouse_picomem_device;
 }
 
 /* ---------- Disk images (pm_disk.cpp, dosbox/bios_disk.cpp) ---------- */
@@ -1658,6 +1789,7 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_DEV_Init:
+            dev->mouse_enabled = 0; /* Enabled later by PMMOUSE. */
             /* TODO: (re)install NE2000, audio, RTC, joystick from config. */
             pm_pc_send(dev, PCC_EndCommand); /* PC_End() */
             break;
@@ -1710,13 +1842,28 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_USB_Enable:
-            dev->data_l = INIT_DISABLED; /* No USB host emulation. */
+            /* The only USB device we emulate is the mouse. */
+            dev->data_l = pm_mouse_selected() ? INIT_DONE : INIT_DISABLED;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Mouse_Enable:
+            picomem_log("PicoMEM: mouse enabled%s\n",
+                        pm_mouse_selected() ? "" : " (PicoMEM USB mouse not selected)");
+            dev->mouse_enabled = 1;
+            dev->mouse_b       = 0;
+            mouse_clear_coords();
+            dev->data_l = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Mouse_Disable:
+            dev->mouse_enabled = 0;
+            dev->data_l        = 0;
             pm_set_status(dev, STAT_READY);
             break;
 
         case CMD_USB_Disable:
-        case CMD_Mouse_Enable:
-        case CMD_Mouse_Disable:
         case CMD_Keyb_OnOff:
             dev->data_l = 0;
             pm_set_status(dev, STAT_READY);
@@ -1733,7 +1880,14 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_USB_Status:
-            dev->ram[PCCR_PARAM] = 0;
+            if (pm_mouse_selected()) {
+                /* Line count, then NUL-terminated lines (pm_cmd.cpp). */
+                char *str = (char *) &dev->ram[PCCR_PARAM + 1];
+                dev->ram[PCCR_PARAM] = 1;
+                strcpy(str, "   USB  : 1 device (mouse)");
+                str[1] = (char) 0xfe;
+            } else
+                dev->ram[PCCR_PARAM] = 0;
             pm_set_status(dev, STAT_READY);
             break;
 
@@ -1849,8 +2003,7 @@ pm_io_write(uint16_t port, uint8_t val, void *priv)
                     if (val == CMD_LockPort)
                         dev->cmd_lock_state = 2;
                     if (val == CMD_PMIRQ_ACK) {
-                        /* TODO: multiplexed IRQ acknowledge. */
-                        picintc(1 << dev->irq);
+                        pm_pm_irq_ack(dev);
                     } else if (val == CMD_DMACPY_ACK) {
                         /* TODO: DMA copy acknowledge. */
                     } else if ((dev->status == STAT_READY) || (val == CMD_Reset)) {
@@ -1896,7 +2049,8 @@ pm_init_shared_ram(picomem_t *dev)
     dev->ram[BV_VARID]     = 0x12;
     dev->ram[BV_PSRAMInit] = PM_PSRAM_SIZE >> 20; /* Number of MB */
     dev->ram[BV_SDInit]    = INIT_DONE;
-    dev->ram[BV_USBInit]   = INIT_DISABLED;
+    dev->ram[BV_USBInit]   = pm_mouse_selected() ? INIT_DONE : INIT_DISABLED;
+    dev->ram[BV_USBDevice] = pm_mouse_selected() ? 0x01 : 0x00;
     dev->ram[BV_CFGInit]   = cfg_loaded ? INIT_DONE : 0xfd;
     dev->ram[BV_WifiInit]  = INIT_DISABLED;
     dev->ram[BV_PortInit]  = 0;
@@ -1927,6 +2081,8 @@ picomem_reset(void *priv)
     dev->pcq_state      = PCQ_IDLE;
     dev->irq_state      = IRQT_IDLE;
     dev->cmd_lock_state = 0;
+    dev->mouse_enabled  = 0; /* PMMOUSE enables it again */
+    pm_irq_clear_vars(dev);
     pm_set_status(dev, STAT_READY);
 }
 
@@ -2002,6 +2158,9 @@ picomem_init(const device_t *info)
 
     pm_set_status(dev, STAT_READY);
 
+    if (pm_mouse_selected() && (pm_mouse_card == NULL))
+        pm_mouse_card = dev;
+
     picomem_log("PicoMEM%s: port %03X, BIOS %05X, IRQ %d, config %s\n",
                 (dev->model == 2) ? " 2" : "", dev->base, dev->bios_addr, dev->irq,
                 dev->ram[BV_CFGInit] == INIT_DONE ? "loaded" : "default");
@@ -2017,6 +2176,8 @@ picomem_close(void *priv)
     for (int i = 0; i < PM_NDISKS; i++)
         pm_disk_close(dev, i);
     pm_ems_remove(dev);
+    if (pm_mouse_card == dev)
+        pm_mouse_card = NULL;
     free(dev->pmram);
     free(dev->psram);
     free(dev);
