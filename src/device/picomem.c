@@ -1537,8 +1537,12 @@ pm_sector_io(pm_disk_t *d, uint32_t lba, uint8_t *buf, int write)
         return 0x04;
     if (fseeko64(d->fp, (int64_t) pos, SEEK_SET) != 0)
         return 0x04;
-    if (write)
-        return (fwrite(buf, 1, 512, d->fp) == 512) ? 0x00 : 0x04;
+    if (write) {
+        if (fwrite(buf, 1, 512, d->fp) != 512)
+            return 0x04;
+        fflush(d->fp); /* Survive a crash or hard kill of the emulator. */
+        return 0x00;
+    }
     return (fread(buf, 1, 512, d->fp) == 512) ? 0x00 : 0x04;
 }
 
