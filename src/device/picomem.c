@@ -36,7 +36,8 @@
  *          configuration persistence (picomem_N.cfg in the VM's NVR
  *          folder), and floppy/hard disk images served from the
  *          "<VM folder>/picomem/{FLOPPY,HDD}" folders through Int13h.
- *          Not yet: EMS, mouse, NE2000, audio, RTC, EtherDFS.
+ *          Lo-tech compatible EMS (up to 4MB) from the PSRAM.
+ *          Not yet: mouse, NE2000, audio, RTC, EtherDFS.
  *
  * Authors: Freddy VETELE (original PicoMEM hardware, firmware and BIOS)
  *
@@ -75,6 +76,11 @@
 
 #define PM_PSRAM_SIZE (8 << 20) /* 8MB PSRAM                 */
 #define PM_NBLOCKS    64        /* 16KB blocks in 1MB        */
+
+/* Lo-tech compatible EMS (dev_memory.h, dev_memory.cpp). */
+#define EMS_PSRAM_BASE (1 << 20) /* EMS pages start 1MB into the PSRAM */
+static const uint16_t pm_ems_ports[]  = { 0, 0x268, 0x288, 0x298, 0x2a8 };
+static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 
 /* Board IDs reported in BV_BoardID (firmware pm_boards/pm.h, pm20.h). */
 #define BOARD_ID_PM1 2
@@ -296,6 +302,11 @@ typedef struct picomem_t {
     int        max_pmram;  /* in 16KB blocks */
     pm_block_t blocks[PM_NBLOCKS];
 
+    /* EMS */
+    uint16_t ems_port;  /* 0 = disabled */
+    uint32_t ems_frame;
+    uint8_t  ems_bank[4];
+
     /* Command interface. */
     uint8_t status;
     uint8_t cmd;
@@ -510,16 +521,84 @@ pm_memory_remove_ram(picomem_t *dev)
     }
 }
 
+/* ---------- EMS (Lo-tech compatible, dev_ems_iow / dev_ems_ior) ---------- */
+
+static void
+pm_ems_map_bank(picomem_t *dev, int bank)
+{
+    int blk = (int) (dev->ems_frame >> 14) + bank;
+
+    pm_block_set(dev, blk, MEM_EMS,
+                 dev->psram + EMS_PSRAM_BASE + ((uint32_t) dev->ems_bank[bank] << 14));
+}
+
+static uint8_t
+pm_ems_read(uint16_t port, void *priv)
+{
+    const picomem_t *dev = (picomem_t *) priv;
+
+    return dev->ems_bank[port & 0x03];
+}
+
+static void
+pm_ems_write(uint16_t port, uint8_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    if ((port & 0x07) < 4) {
+        dev->ems_bank[port & 0x03] = val;
+        pm_ems_map_bank(dev, port & 0x03);
+    }
+}
+
+static void
+pm_ems_remove(picomem_t *dev)
+{
+    if (dev->ems_port != 0)
+        io_removehandler(dev->ems_port, 8, pm_ems_read, NULL, NULL, pm_ems_write, NULL, NULL, dev);
+    dev->ems_port = 0;
+}
+
+/* dev_ems_install(): 8-port block at "port", 64KB frame at "frame". */
+static void
+pm_ems_install(picomem_t *dev, uint16_t port, uint32_t frame)
+{
+    pm_ems_remove(dev);
+    if (port == 0)
+        return;
+    if (pm_block_is_bios(dev, frame >> 14) || pm_block_is_bios(dev, (frame >> 14) + 3)) {
+        picomem_log("PicoMEM: EMS frame %05X overlaps the BIOS, disabled\n", frame);
+        return;
+    }
+
+    dev->ems_port  = port;
+    dev->ems_frame = frame;
+    io_sethandler(port, 8, pm_ems_read, NULL, NULL, pm_ems_write, NULL, NULL, dev);
+    for (int i = 0; i < 4; i++) {
+        dev->ems_bank[i] = 0;
+        pm_ems_map_bank(dev, i);
+    }
+    dev->ram[BV_SPIPSRAM]  = 1;
+    dev->ram[BV_Int13hCLI] = 1;
+    picomem_log("PicoMEM: EMS port %03X, frame %05X\n", port, frame);
+}
+
 /* dev_memory_install_all(): map RAM/PSRAM according to the config MEM_Map. */
 static void
 pm_memory_install_all(picomem_t *dev)
 {
-    const uint8_t *map = &pm_cfg(dev)[CFG_MEM_MAP];
+    const uint8_t *cfg   = pm_cfg(dev);
+    const uint8_t *map   = &cfg[CFG_MEM_MAP];
     int            first = -1;
 
     pm_memory_remove_ram(dev);
 
-    /* TODO: EMS (Lo-tech compatible) from the PSRAM. */
+    /* EMS first, as in the firmware. */
+    if ((cfg[CFG_EMS_PORT] < (sizeof(pm_ems_ports) / sizeof(pm_ems_ports[0]))) &&
+        (cfg[CFG_EMS_ADDR] < (sizeof(pm_ems_frames) / sizeof(pm_ems_frames[0]))))
+        pm_ems_install(dev, pm_ems_ports[cfg[CFG_EMS_PORT]], pm_ems_frames[cfg[CFG_EMS_ADDR]]);
+    else
+        pm_ems_remove(dev);
 
     /* Internal ("PM") RAM: contiguous from the first MEM_RAM block. */
     if (dev->ram[BV_TdyRAM] == 0) {
@@ -539,7 +618,7 @@ pm_memory_install_all(picomem_t *dev)
     for (int i = 0; i < PM_NBLOCKS; i++) {
         if ((dev->ram[BV_Tandy] != 0) && (i < (0x0a * 4)))
             continue;
-        if (map[i] == MEM_PSRAM) {
+        if ((map[i] == MEM_PSRAM) && (dev->blocks[i].type != MEM_EMS)) {
             pm_block_set(dev, i, MEM_PSRAM, dev->psram + ((uint32_t) i << 14));
             dev->ram[BV_SPIPSRAM]  = 1;
             dev->ram[BV_Int13hCLI] = 1;
@@ -1937,6 +2016,7 @@ picomem_close(void *priv)
 
     for (int i = 0; i < PM_NDISKS; i++)
         pm_disk_close(dev, i);
+    pm_ems_remove(dev);
     free(dev->pmram);
     free(dev->psram);
     free(dev);
