@@ -87,6 +87,7 @@
 #include <86box/ui.h>
 #include <86box/plat.h>
 #include <86box/isamem.h>
+#include <86box/picomem.h>
 
 #include "cpu.h"
 
@@ -2322,6 +2323,9 @@ static const struct {
 #endif /* USE_ISAMEM_IAB */
     { &lotech_ems_device   },
     { &mplus2_device       },
+    // Multifunction cards
+    { &picomem_device      },
+    { &picomem2_device     },
     { NULL                 }
     // clang-format on
 };

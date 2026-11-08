@@ -1,0 +1,1171 @@
+/*
+ * 86Box    A hypervisor and IBM PC system emulator that specializes in
+ *          running old operating systems and software designed for IBM
+ *          PC systems and compatibles from 1981 through fairly recent
+ *          system designs based on the PCI bus.
+ *
+ *          This file is part of the 86Box distribution.
+ *
+ *          Emulation of the PicoMEM and PicoMEM 2 ISA cards by
+ *          Freddy VETELE (https://github.com/FreddyVRetro/ISA-PicoMEM).
+ *
+ *          The real card is a Raspberry Pi Pico (RP2040/RP2350) that
+ *          snoops the 8-bit ISA bus and emulates ROM, RAM and I/O
+ *          devices in firmware. This file emulates the Pico side at a
+ *          high level (HLE): the unmodified PicoMEM BIOS ROM runs on
+ *          the emulated PC and talks to us through:
+ *
+ *            - I/O ports base+0..5 (default 2A0h): command/status,
+ *              two data bytes, an auto-incrementing test port and a
+ *              byte transfer port.
+ *            - 8KB of "shared" RAM mapped just after the 16KB BIOS ROM
+ *              (BIOS variables, config table, register save area and
+ *              the "PC command" mailbox used by the Pico to make the
+ *              PC run small jobs such as printing or ending a command).
+ *            - 16KB memory blocks that the card can map anywhere in the
+ *              first megabyte (fast internal RAM or PSRAM).
+ *
+ *          The shared-RAM layout, command numbers and behaviour follow
+ *          the firmware sources (src/pm_defines.h, src/pm_cmd.cpp,
+ *          src/pm_libs/pm_pccmd.cpp, src/isa_devices/dev_picomem_io.cpp
+ *          and dev_memory.cpp), which are GPL-2.0-or-later.
+ *
+ *          Implemented so far: BIOS ROM + shared RAM, detection, the
+ *          boot-time command set, IRQ detection, memory scan and
+ *          conventional/UMB RAM emulation from internal RAM and PSRAM,
+ *          and configuration persistence (picomem.cfg in the VM's NVR
+ *          folder). Not yet: disk images (Int13h), EMS, mouse, NE2000,
+ *          audio, RTC, EtherDFS.
+ *
+ * Authors: Freddy VETELE (original PicoMEM hardware, firmware and BIOS)
+ *
+ *          Copyright 2023-2026 Freddy VETELE.
+ */
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#define HAVE_STDARG_H
+#include <86box/86box.h>
+#include <86box/io.h>
+#include <86box/timer.h>
+#include <86box/device.h>
+#include <86box/mem.h>
+#include <86box/rom.h>
+#include <86box/nvr.h>
+#include <86box/pic.h>
+#include <86box/picomem.h>
+
+/* Logging is on while the emulation is being developed. */
+#ifndef ENABLE_PICOMEM_LOG
+#    define ENABLE_PICOMEM_LOG 1
+#endif
+
+#define PICOMEM_BIOS_PM1 "roms/memcard/picomem/pmbios.bin"
+#define PICOMEM_BIOS_PM2 "roms/memcard/picomem/pm2bios.bin"
+
+#define PM_ROM_SIZE 0x4000 /* 16KB BIOS ROM            */
+#define PM_RAM_SIZE 0x2000 /* 8KB shared "BIOS RAM"    */
+
+#define PM_PSRAM_SIZE (8 << 20) /* 8MB PSRAM                 */
+#define PM_NBLOCKS    64        /* 16KB blocks in 1MB        */
+
+/* Board IDs reported in BV_BoardID (firmware pm_boards/pm.h, pm20.h). */
+#define BOARD_ID_PM1 2
+#define BOARD_ID_PM2 11
+
+/* I/O port offsets (dev_picomem_io.h). */
+#define PORT_PM_CMD_STATUS 0
+#define PORT_PM_CMD_DATAL  1
+#define PORT_PM_CMD_DATAH  2
+#define PORT_TEST          3
+#define PORT_TR_L          4
+#define PORT_TR_H          5
+
+/* Status values. */
+#define STAT_READY         0x00
+#define STAT_CMDINPROGRESS 0x01
+#define STAT_CMDERROR      0x02
+#define STAT_CMDNOTFOUND   0x03
+
+/* Commands (pm_defines.h). */
+#define CMD_Reset         0x00
+#define CMD_PMIRQ_ACK     0x01
+#define CMD_DMACPY_ACK    0x02
+#define CMD_GetMEMType    0x05
+#define CMD_SetMEMType    0x06
+#define CMD_MEM_Init      0x07
+#define CMD_SaveCfg       0x08
+#define CMD_DEV_Init      0x09
+#define CMD_TDY_Init      0x0A
+#define CMD_Test_RAM      0x0B
+#define CMD_GetBasePort   0x0D
+#define CMD_SetBasePort   0x0E
+#define CMD_GetPMString   0x10
+#define CMD_SendIRQ       0x30
+#define CMD_IRQAck        0x31
+#define CMD_LockPort      0x37
+#define CMD_SetMEM        0x42
+#define CMD_TestMEM       0x43
+#define CMD_PCINFO        0x44
+#define CMD_BIOS_MENU     0x45
+#define CMD_USB_Enable    0x50
+#define CMD_USB_Disable   0x51
+#define CMD_Mouse_Enable  0x52
+#define CMD_Mouse_Disable 0x53
+#define CMD_Joy_OnOff     0x54
+#define CMD_Keyb_OnOff    0x55
+#define CMD_Wifi_Infos    0x60
+#define CMD_USB_Status    0x61
+#define CMD_DISK_Status   0x62
+#define CMD_HDD_Getlist   0x80
+#define CMD_HDD_Getinfos  0x81
+#define CMD_HDD_Mount     0x82
+#define CMD_FDD_Getlist   0x83
+#define CMD_FDD_Getinfos  0x84
+#define CMD_FDD_Mount     0x85
+#define CMD_Image_Select  0x87
+#define CMD_Int13h        0x88
+
+#define CMDERR_WRITE     0x01
+#define CMDERR_FILEREAD  0x08
+
+#define INIT_DONE     0x00
+#define INIT_SKIPPED  0xFC
+#define INIT_DISABLED 0xFF
+
+/* Memory types (dev_memory.h). */
+#define MEM_NULL  0
+#define MEM_RAM   1
+#define MEM_DISK  2
+#define MEM_BIOS  8
+#define MEM_PSRAM 16
+#define MEM_EMS   17
+
+/* Shared RAM layout (pm_defines.h). */
+#define BV_VARID       0
+#define BV_Test        1
+#define BV_InitCount   2
+#define BV_PSRAMInit   4
+#define BV_SDInit      5
+#define BV_USBInit     6
+#define BV_CFGInit     7
+#define BV_WifiInit    8
+#define BV_PortInit    9
+#define BV_IRQ         11
+#define BV_HWIRQ       12
+#define BV_Int13hCLI   14
+#define BV_SPIPSRAM    15
+#define PC_DiskNB      17
+#define PC_FloppyNB    18
+#define PC_MEM         19 /* word */
+#define New_DiskNB     21
+#define New_FloppyNB   22
+#define BV_Tandy       23
+#define BV_TdyRAM      24
+#define BV_CmdRunning  25
+#define BV_PCCMD_SRC   26
+#define BV_BoardID     27
+#define BV_PicoID      28
+
+#define REGS_OFFS   64
+#define CONF_OFFS   82
+#define CONF_SIZE   768
+#define PCCMD_OFFS  (CONF_OFFS + CONF_SIZE) /* 850 */
+#define PCCR_PCSTATE (PCCMD_OFFS + 0)
+#define PCCR_CMD     (PCCMD_OFFS + 1)
+#define PCCR_PMSTATE (PCCMD_OFFS + 2)
+#define PCCR_PARAM   (PCCMD_OFFS + 36)
+
+/* Offsets inside the PMCFG_t config table. */
+#define CFG_FDD          0  /* 2 x {u16 size; char name[14]} */
+#define CFG_HDD          32 /* 4 x {u16 size; char name[14]} */
+#define CFG_FDD_ATTR     96
+#define CFG_HDD_ATTR     98
+#define CFG_MEM_MAP      138
+#define CFG_EMS_PORT     202
+#define CFG_EMS_ADDR     203
+#define CFG_PMRAM_EXT    204
+#define CFG_PSRAM_EXT    205
+#define CFG_ENABLE_USB   210
+#define CFG_ENABLE_WIFI  214
+#define CFG_NE2000_PORT  216
+#define CFG_B_MAX_PMRAM  220
+#define CFG_PREBOOT      222
+#define CFG_BIOSBOOT     223
+/* Size of the part of PMCFG_t saved to picomem.cfg (sizeof(PMCFG_t)). */
+#define CFG_FILE_SIZE    CONF_SIZE
+
+/* PC command mailbox (pm_pccmd.h). */
+#define PCC_PCS_NOTREADY   0x00
+#define PCC_PCS_WAITCMD    0x01
+#define PCC_PCS_INPROGRESS 0x02
+#define PCC_PCS_CMDEND     0x03
+#define PCC_PCS_RESET      0x20
+#define PCC_PMS_CMDSENT    0x01
+#define PCC_PMS_CMDACK     0x02
+#define PCC_EndCommand     0
+#define PCC_Printf         16
+
+/* Polling interval for the "Pico core" state machines. */
+#define PM_POLL_US 5.0
+
+enum {
+    PCQ_IDLE = 0,
+    PCQ_WAIT_READY,   /* PC_Wait_CMD_End / start of Send_PC_CMD   */
+    PCQ_WAIT_WAITCMD, /* waiting for the PC to see the ACK        */
+    PCQ_WAIT_START,   /* waiting for the PC to start the command  */
+    PCQ_WAIT_DONE     /* waiting for a non-End command to finish  */
+};
+
+enum {
+    IRQT_IDLE = 0,
+    IRQT_HIGH,   /* IRQ line held active for 2ms     */
+    IRQT_SETTLE  /* 20ms wait after the pulse        */
+};
+
+typedef struct pm_block_t {
+    mem_mapping_t mapping;
+    uint8_t      *ptr; /* backing storage for this 16KB block */
+    uint8_t       type;
+} pm_block_t;
+
+typedef struct picomem_t {
+    int      model; /* 1 or 2 */
+    uint16_t base;
+    uint32_t bios_addr;
+    int      irq;
+    int      inst;
+
+    uint8_t rom[PM_ROM_SIZE];
+    uint8_t ram[PM_RAM_SIZE];
+
+    mem_mapping_t rom_mapping;
+    mem_mapping_t ram_mapping;
+
+    /* Emulated memory. */
+    uint8_t   *pmram;      /* fast internal RAM (128KB / 256KB) */
+    uint32_t   pmram_size;
+    uint8_t   *psram;      /* 8MB PSRAM */
+    int        max_pmram;  /* in 16KB blocks */
+    pm_block_t blocks[PM_NBLOCKS];
+
+    /* Command interface. */
+    uint8_t status;
+    uint8_t cmd;
+    uint8_t data_l;
+    uint8_t data_h;
+    uint8_t test_read;
+    uint8_t cmd_lock_state;
+
+    /* "Pico core" asynchronous work. */
+    pc_timer_t poll_timer;
+    int        pcq_state;
+    uint8_t    pcq_cmd;
+    pc_timer_t irq_timer;
+    int        irq_state;
+
+    char cfg_path[64];
+} picomem_t;
+
+#ifdef ENABLE_PICOMEM_LOG
+int picomem_do_log = ENABLE_PICOMEM_LOG;
+
+static void
+picomem_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (picomem_do_log) {
+        va_start(ap, fmt);
+        pclog_ex(fmt, ap);
+        va_end(ap);
+    }
+}
+#else
+#    define picomem_log(fmt, ...)
+#endif
+
+/* ---------- Shared RAM helpers ---------- */
+
+static inline uint8_t *
+pm_cfg(picomem_t *dev)
+{
+    return &dev->ram[CONF_OFFS];
+}
+
+static void
+pm_set_status(picomem_t *dev, uint8_t status)
+{
+    dev->status                = status;
+    dev->ram[BV_CmdRunning]    = (status == STAT_CMDINPROGRESS) ? dev->cmd : 0;
+}
+
+/* ---------- BIOS ROM and shared RAM windows ---------- */
+
+static uint8_t
+pm_rom_read(uint32_t addr, void *priv)
+{
+    const picomem_t *dev = (picomem_t *) priv;
+
+    return dev->rom[addr & (PM_ROM_SIZE - 1)];
+}
+
+static uint16_t
+pm_rom_readw(uint32_t addr, void *priv)
+{
+    const picomem_t *dev = (picomem_t *) priv;
+    addr &= (PM_ROM_SIZE - 1);
+
+    return dev->rom[addr] | (dev->rom[(addr + 1) & (PM_ROM_SIZE - 1)] << 8);
+}
+
+static uint8_t
+pm_ram_read(uint32_t addr, void *priv)
+{
+    const picomem_t *dev = (picomem_t *) priv;
+
+    return dev->ram[addr & (PM_RAM_SIZE - 1)];
+}
+
+static uint16_t
+pm_ram_readw(uint32_t addr, void *priv)
+{
+    const picomem_t *dev = (picomem_t *) priv;
+    addr &= (PM_RAM_SIZE - 1);
+
+    return dev->ram[addr] | (dev->ram[(addr + 1) & (PM_RAM_SIZE - 1)] << 8);
+}
+
+static void
+pm_ram_write(uint32_t addr, uint8_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    dev->ram[addr & (PM_RAM_SIZE - 1)] = val;
+}
+
+static void
+pm_ram_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+    addr &= (PM_RAM_SIZE - 1);
+
+    dev->ram[addr]                           = val & 0xff;
+    dev->ram[(addr + 1) & (PM_RAM_SIZE - 1)] = val >> 8;
+}
+
+/* ---------- 16KB emulated memory blocks ---------- */
+
+static uint8_t
+pm_blk_read(uint32_t addr, void *priv)
+{
+    const pm_block_t *blk = (pm_block_t *) priv;
+
+    return blk->ptr[addr & 0x3fff];
+}
+
+static uint16_t
+pm_blk_readw(uint32_t addr, void *priv)
+{
+    const pm_block_t *blk = (pm_block_t *) priv;
+    uint32_t          off = addr & 0x3fff;
+
+    if (off == 0x3fff)
+        return blk->ptr[off] | (mem_readb_phys(addr + 1) << 8);
+    return blk->ptr[off] | (blk->ptr[off + 1] << 8);
+}
+
+static void
+pm_blk_write(uint32_t addr, uint8_t val, void *priv)
+{
+    pm_block_t *blk = (pm_block_t *) priv;
+
+    blk->ptr[addr & 0x3fff] = val;
+}
+
+static void
+pm_blk_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    pm_block_t *blk = (pm_block_t *) priv;
+    uint32_t    off = addr & 0x3fff;
+
+    blk->ptr[off] = val & 0xff;
+    if (off == 0x3fff)
+        mem_writeb_phys(addr + 1, val >> 8);
+    else
+        blk->ptr[off + 1] = val >> 8;
+}
+
+/* Is block i (16KB) overlapping the card's own BIOS ROM/RAM window? */
+static int
+pm_block_is_bios(const picomem_t *dev, int i)
+{
+    uint32_t start = (uint32_t) i << 14;
+    uint32_t end   = start + 0x4000;
+
+    if (dev->bios_addr == 0)
+        return 0;
+    return (start < (dev->bios_addr + PM_ROM_SIZE + PM_RAM_SIZE)) && (end > dev->bios_addr);
+}
+
+static void
+pm_block_set(picomem_t *dev, int i, uint8_t type, uint8_t *ptr)
+{
+    pm_block_t *blk = &dev->blocks[i];
+
+    if ((i < 0) || (i >= PM_NBLOCKS))
+        return;
+
+    if ((type != MEM_NULL) && ((ptr == NULL) || pm_block_is_bios(dev, i))) {
+        picomem_log("PicoMEM: refusing to map block %02X (type %d)\n", i, type);
+        type = MEM_NULL;
+    }
+
+    blk->type = type;
+    blk->ptr  = (type == MEM_NULL) ? NULL : ptr;
+
+    if (type == MEM_NULL)
+        mem_mapping_disable(&blk->mapping);
+    else {
+        mem_mapping_set_exec(&blk->mapping, blk->ptr);
+        mem_mapping_enable(&blk->mapping);
+    }
+}
+
+static uint8_t
+pm_get_mem_type(const picomem_t *dev, int i)
+{
+    if ((i < 0) || (i >= PM_NBLOCKS))
+        return MEM_NULL;
+    if (pm_block_is_bios(dev, i))
+        return ((((uint32_t) i << 14) - dev->bios_addr) < PM_ROM_SIZE) ? MEM_BIOS : MEM_DISK;
+    return dev->blocks[i].type;
+}
+
+/* dev_memory_remove_ram() */
+static void
+pm_memory_remove_ram(picomem_t *dev)
+{
+    for (int i = 0; i < PM_NBLOCKS; i++) {
+        uint8_t t = dev->blocks[i].type;
+
+        if ((dev->ram[BV_Tandy] != 0) && (i < (0x0a * 4)))
+            continue;
+        if ((t == MEM_RAM) || (t == MEM_PSRAM) || (t == MEM_EMS))
+            pm_block_set(dev, i, MEM_NULL, NULL);
+    }
+}
+
+/* dev_memory_install_all(): map RAM/PSRAM according to the config MEM_Map. */
+static void
+pm_memory_install_all(picomem_t *dev)
+{
+    const uint8_t *map = &pm_cfg(dev)[CFG_MEM_MAP];
+    int            first = -1;
+
+    pm_memory_remove_ram(dev);
+
+    /* TODO: EMS (Lo-tech compatible) from the PSRAM. */
+
+    /* Internal ("PM") RAM: contiguous from the first MEM_RAM block. */
+    if (dev->ram[BV_TdyRAM] == 0) {
+        for (int i = 0; i < PM_NBLOCKS; i++) {
+            if ((dev->ram[BV_Tandy] != 0) && (i < (0x0a * 4)))
+                continue;
+            if (map[i] != MEM_RAM)
+                continue;
+            if (first < 0)
+                first = i;
+            if ((i - first) < dev->max_pmram)
+                pm_block_set(dev, i, MEM_RAM, dev->pmram + ((uint32_t) (i - first) << 14));
+        }
+    }
+
+    /* PSRAM: indexed by PC address. */
+    for (int i = 0; i < PM_NBLOCKS; i++) {
+        if ((dev->ram[BV_Tandy] != 0) && (i < (0x0a * 4)))
+            continue;
+        if (map[i] == MEM_PSRAM) {
+            pm_block_set(dev, i, MEM_PSRAM, dev->psram + ((uint32_t) i << 14));
+            dev->ram[BV_SPIPSRAM]  = 1;
+            dev->ram[BV_Int13hCLI] = 1;
+        }
+    }
+
+    for (int i = 0; i < PM_NBLOCKS; i++) {
+        if (dev->blocks[i].type != MEM_NULL)
+            picomem_log("PicoMEM: block %05X = type %d\n", i << 14, dev->blocks[i].type);
+    }
+}
+
+/* ---------- Configuration persistence (picomem.cfg on the "SD card") ---------- */
+
+static int
+pm_load_config(picomem_t *dev)
+{
+    FILE *fp = nvr_fopen(dev->cfg_path, "rb");
+    int   ok = 0;
+
+    memset(pm_cfg(dev), 0x00, CONF_SIZE);
+    if (fp != NULL) {
+        ok = (fread(pm_cfg(dev), 1, CFG_FILE_SIZE, fp) > 0);
+        fclose(fp);
+    }
+    return ok;
+}
+
+static int
+pm_save_config(picomem_t *dev)
+{
+    FILE *fp = nvr_fopen(dev->cfg_path, "wb");
+
+    if (fp == NULL)
+        return 0;
+    fwrite(pm_cfg(dev), 1, CFG_FILE_SIZE, fp);
+    fclose(fp);
+    return 1;
+}
+
+/* ---------- "Pico core": PC command mailbox (pm_pccmd.cpp) ---------- */
+
+static void
+pm_poll_start(picomem_t *dev)
+{
+    if (!timer_is_enabled(&dev->poll_timer))
+        timer_on_auto(&dev->poll_timer, PM_POLL_US);
+}
+
+/* Queue a PC command; only one may be in flight (the firmware is sequential). */
+static void
+pm_pc_send(picomem_t *dev, uint8_t pc_cmd)
+{
+    dev->pcq_cmd   = pc_cmd;
+    dev->pcq_state = PCQ_WAIT_READY;
+    pm_poll_start(dev);
+}
+
+/* Called when the Pico-side command sequence has completed. */
+static void
+pm_pc_finished(picomem_t *dev)
+{
+    dev->pcq_state = PCQ_IDLE;
+    if (dev->status == STAT_CMDINPROGRESS)
+        pm_set_status(dev, STAT_READY);
+}
+
+static void
+pm_poll_timer(void *priv)
+{
+    picomem_t *dev     = (picomem_t *) priv;
+    uint8_t    pcstate = dev->ram[PCCR_PCSTATE];
+
+    if ((dev->pcq_state != PCQ_IDLE) && (pcstate == PCC_PCS_RESET)) {
+        /* The PC asked to unblock us: give up on the PC command. */
+        picomem_log("PicoMEM: PC command aborted by PC reset state\n");
+        pm_pc_finished(dev);
+        return;
+    }
+
+    switch (dev->pcq_state) {
+        case PCQ_WAIT_READY:
+            if (pcstate == PCC_PCS_CMDEND) {
+                dev->ram[PCCR_PMSTATE] = PCC_PMS_CMDACK;
+                dev->pcq_state         = PCQ_WAIT_WAITCMD;
+            } else if (pcstate == PCC_PCS_WAITCMD)
+                goto send;
+            break;
+
+        case PCQ_WAIT_WAITCMD:
+            if (pcstate == PCC_PCS_WAITCMD)
+                goto send;
+            break;
+
+        case PCQ_WAIT_START:
+            if (pcstate != PCC_PCS_WAITCMD) {
+                if (dev->pcq_cmd == PCC_EndCommand)
+                    pm_pc_finished(dev);
+                else
+                    dev->pcq_state = PCQ_WAIT_DONE;
+            }
+            break;
+
+        case PCQ_WAIT_DONE:
+            if ((pcstate == PCC_PCS_CMDEND) || (pcstate == PCC_PCS_WAITCMD)) {
+                /* A non-End command finished; always follow with PC_End. */
+                pm_pc_send(dev, PCC_EndCommand);
+            }
+            break;
+
+        default:
+            return;
+    }
+
+    if (dev->pcq_state != PCQ_IDLE)
+        timer_on_auto(&dev->poll_timer, PM_POLL_US);
+    return;
+
+send:
+    dev->ram[PCCR_CMD]     = dev->pcq_cmd;
+    dev->ram[PCCR_PMSTATE] = PCC_PMS_CMDSENT;
+    dev->pcq_state         = PCQ_WAIT_START;
+    timer_on_auto(&dev->poll_timer, PM_POLL_US);
+}
+
+/* Print a string on the PC screen through the BIOS (PC_printf), then end. */
+static void
+pm_pc_printf(picomem_t *dev, const char *str)
+{
+    size_t len = strlen(str);
+
+    if (len > 1024)
+        len = 1024;
+    memcpy(&dev->ram[PCCR_PARAM], str, len);
+    dev->ram[PCCR_PARAM + len] = 0x00;
+    pm_pc_send(dev, PCC_Printf);
+}
+
+/* ---------- IRQ detection (CMD_SendIRQ) ---------- */
+
+static void
+pm_irq_timer(void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    switch (dev->irq_state) {
+        case IRQT_HIGH:
+            picintc(1 << dev->irq);
+            dev->irq_state = IRQT_SETTLE;
+            timer_on_auto(&dev->irq_timer, 20000.0);
+            break;
+
+        case IRQT_SETTLE:
+            dev->irq_state = IRQT_IDLE;
+            picomem_log("PicoMEM: IRQ detected: %d mask %02X\n",
+                        dev->ram[BV_IRQ], dev->ram[BV_HWIRQ]);
+            if (dev->status == STAT_CMDINPROGRESS)
+                pm_set_status(dev, STAT_READY);
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* ---------- Command execution (PM_ExecCMD) ---------- */
+
+static void
+pm_disk_status_string(picomem_t *dev)
+{
+    /* No disk image emulation yet: report zero lines. */
+    dev->ram[PCCR_PARAM] = 0;
+}
+
+static void
+pm_exec_cmd(picomem_t *dev)
+{
+    uint8_t *cfg = pm_cfg(dev);
+    uint8_t  tmp;
+
+    picomem_log("PicoMEM: CMD %02X (H=%02X L=%02X)\n", dev->cmd, dev->data_h, dev->data_l);
+
+    switch (dev->cmd) {
+        case CMD_Reset:
+            dev->pcq_state = PCQ_IDLE;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_GetBasePort:
+            dev->data_l = dev->base & 0xff;
+            dev->data_h = dev->base >> 8;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SetBasePort: /* Not supported by the firmware either. */
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_GetMEMType:
+            dev->data_h = (dev->data_l < PM_NBLOCKS) ? pm_get_mem_type(dev, dev->data_l) : 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SetMEMType:
+            /* Used by the BIOS memory scan: map one 16KB test block. */
+            if (dev->data_l < PM_NBLOCKS) {
+                switch (dev->data_h) {
+                    case MEM_RAM:
+                        dev->pmram[0] = 0x12;
+                        pm_block_set(dev, dev->data_l, MEM_RAM, dev->pmram);
+                        break;
+                    case MEM_PSRAM:
+                        pm_block_set(dev, dev->data_l, MEM_PSRAM,
+                                     dev->psram + ((uint32_t) dev->data_l << 14));
+                        break;
+                    default:
+                        pm_block_set(dev, dev->data_l, MEM_NULL, NULL);
+                        break;
+                }
+            }
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_MEM_Init:
+            picomem_log("PicoMEM: MEM Init, PC RAM %d KB\n",
+                        dev->ram[PC_MEM] | (dev->ram[PC_MEM + 1] << 8));
+            pm_memory_install_all(dev);
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SaveCfg:
+            dev->data_l = 0;
+            if (pm_save_config(dev))
+                pm_set_status(dev, STAT_READY);
+            else {
+                dev->data_l = CMDERR_WRITE;
+                pm_set_status(dev, STAT_CMDERROR);
+            }
+            break;
+
+        case CMD_DEV_Init:
+            /* TODO: (re)install NE2000, audio, RTC, joystick from config. */
+            pm_pc_send(dev, PCC_EndCommand); /* PC_End() */
+            break;
+
+        case CMD_TDY_Init:
+            /* TODO: Tandy conventional RAM extension. */
+            picomem_log("PicoMEM: Tandy RAM init not implemented\n");
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Test_RAM:
+            tmp                 = dev->ram[BV_Test];
+            dev->ram[BV_Test]   = dev->data_l;
+            dev->data_l         = tmp;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_GetPMString:
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SetMEM:
+            memset(dev->pmram, dev->data_l, MIN(65536, dev->pmram_size));
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_TestMEM:
+            pm_set_status(dev, STAT_READY);
+            for (uint32_t i = 0; i < MIN(65536, dev->pmram_size); i++) {
+                if (dev->pmram[i] != dev->data_l) {
+                    pm_set_status(dev, STAT_CMDERROR);
+                    break;
+                }
+            }
+            break;
+
+        case CMD_SendIRQ:
+            /* Pulse our IRQ line; the BIOS test handlers record it. */
+            dev->ram[BV_IRQ]   = 0;
+            dev->ram[BV_HWIRQ] = 0;
+            picintc(1 << dev->irq);
+            picint(1 << dev->irq);
+            dev->irq_state = IRQT_HIGH;
+            timer_on_auto(&dev->irq_timer, 2000.0);
+            break;
+
+        case CMD_IRQAck:
+            picintc(1 << dev->irq);
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_USB_Enable:
+            dev->data_l = INIT_DISABLED; /* No USB host emulation. */
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_USB_Disable:
+        case CMD_Mouse_Enable:
+        case CMD_Mouse_Disable:
+        case CMD_Keyb_OnOff:
+            dev->data_l = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Joy_OnOff:
+            dev->data_l = 1; /* Error: not available. */
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Wifi_Infos:
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_USB_Status:
+            dev->ram[PCCR_PARAM] = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_DISK_Status:
+            pm_disk_status_string(dev);
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_HDD_Getlist:
+        case CMD_FDD_Getlist:
+            /* TODO: list images from a host folder. */
+            dev->data_l = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_HDD_Getinfos:
+        case CMD_FDD_Getinfos:
+        case CMD_Image_Select:
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_HDD_Mount:
+            /* No images yet: every HDD keeps pointing to the PC's own disks. */
+            for (int i = 0; i < 4; i++)
+                cfg[CFG_HDD_ATTR + i] = i;
+            dev->ram[New_DiskNB] = 0;
+            for (int i = 0; i < 4; i++) {
+                if (cfg[CFG_HDD_ATTR + i] < dev->ram[PC_DiskNB])
+                    dev->ram[New_DiskNB]++;
+            }
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_FDD_Mount:
+            for (int i = 0; i < 2; i++)
+                cfg[CFG_FDD_ATTR + i] = i;
+            dev->ram[New_FloppyNB] = dev->ram[PC_FloppyNB];
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_Int13h:
+            /* No emulated disks yet: fail the call. */
+            dev->ram[REGS_OFFS + 1]  = 0x04; /* AH */
+            dev->ram[REGS_OFFS + 0]  = 0xff; /* AL */
+            dev->ram[REGS_OFFS + 16] = 1;    /* CF */
+            pm_pc_send(dev, PCC_EndCommand);
+            break;
+
+        case CMD_PCINFO:
+            pm_pc_printf(dev, "\r\nPicoMEM: emulated by 86Box\r\n");
+            break;
+
+        case CMD_BIOS_MENU:
+            pm_pc_send(dev, PCC_EndCommand);
+            break;
+
+        default:
+            picomem_log("PicoMEM: command %02X not implemented\n", dev->cmd);
+            pm_set_status(dev, STAT_CMDNOTFOUND);
+            break;
+    }
+}
+
+/* ---------- I/O ports (dev_picomem_io.cpp) ---------- */
+
+static uint8_t
+pm_io_read(uint16_t port, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+    uint8_t    ret = 0xff;
+
+    switch (port - dev->base) {
+        case PORT_PM_CMD_STATUS:
+            ret = dev->status;
+            break;
+        case PORT_PM_CMD_DATAL:
+            ret = dev->data_l;
+            break;
+        case PORT_PM_CMD_DATAH:
+            ret = dev->data_h;
+            break;
+        case PORT_TEST:
+            ret = dev->test_read++;
+            break;
+        default:
+            break;
+    }
+
+    return ret;
+}
+
+static void
+pm_io_write(uint16_t port, uint8_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    switch (port - dev->base) {
+        case PORT_PM_CMD_STATUS:
+            switch (dev->cmd_lock_state) {
+                case 0:
+                    if (val == CMD_LockPort)
+                        dev->cmd_lock_state = 2;
+                    if (val == CMD_PMIRQ_ACK) {
+                        /* TODO: multiplexed IRQ acknowledge. */
+                        picintc(1 << dev->irq);
+                    } else if (val == CMD_DMACPY_ACK) {
+                        /* TODO: DMA copy acknowledge. */
+                    } else if ((dev->status == STAT_READY) || (val == CMD_Reset)) {
+                        dev->cmd = val;
+                        pm_set_status(dev, STAT_CMDINPROGRESS);
+                        pm_exec_cmd(dev);
+                    }
+                    break;
+                case 1:
+                    dev->cmd_lock_state = (val == 0x94) ? 0 : 2;
+                    break;
+                case 2:
+                    if (val == 0x37)
+                        dev->cmd_lock_state = 1;
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case PORT_PM_CMD_DATAL:
+            dev->data_l = val;
+            break;
+        case PORT_PM_CMD_DATAH:
+            dev->data_h = val;
+            break;
+        default:
+            break;
+    }
+}
+
+/* ---------- Device ---------- */
+
+static void
+pm_init_shared_ram(picomem_t *dev)
+{
+    uint8_t *cfg;
+    int      cfg_loaded;
+
+    memset(dev->ram, 0x00, PM_RAM_SIZE);
+    cfg_loaded = pm_load_config(dev);
+    cfg        = pm_cfg(dev);
+
+    dev->ram[BV_VARID]     = 0x12;
+    dev->ram[BV_PSRAMInit] = PM_PSRAM_SIZE >> 20; /* Number of MB */
+    dev->ram[BV_SDInit]    = INIT_DONE;
+    dev->ram[BV_USBInit]   = INIT_DISABLED;
+    dev->ram[BV_CFGInit]   = cfg_loaded ? INIT_DONE : 0xfd;
+    dev->ram[BV_WifiInit]  = INIT_DISABLED;
+    dev->ram[BV_PortInit]  = 0;
+    dev->ram[BV_IRQ]       = 0;
+    dev->ram[BV_Tandy]     = 0;
+    dev->ram[BV_TdyRAM]    = 0;
+    dev->ram[BV_BoardID]   = (dev->model == 2) ? BOARD_ID_PM2 : BOARD_ID_PM1;
+
+    /* Values forced by the firmware after loading the config. */
+    cfg[CFG_PREBOOT]     = 0;
+    cfg[CFG_BIOSBOOT]    = 0;
+    cfg[CFG_B_MAX_PMRAM] = dev->max_pmram;
+    cfg[CFG_ENABLE_USB]  = 1;
+    cfg[CFG_ENABLE_WIFI] = 0;
+    cfg[CFG_NE2000_PORT] = cfg[CFG_NE2000_PORT + 1] = 0;
+}
+
+static void
+picomem_reset(void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    /* The Pico is not reset by the ISA RESET line: keep RAM, mappings
+       and config. Only the in-flight PC-side state is lost. */
+    timer_disable(&dev->poll_timer);
+    timer_disable(&dev->irq_timer);
+    picintc(1 << dev->irq);
+    dev->pcq_state      = PCQ_IDLE;
+    dev->irq_state      = IRQT_IDLE;
+    dev->cmd_lock_state = 0;
+    pm_set_status(dev, STAT_READY);
+}
+
+static void *
+picomem_init(const device_t *info)
+{
+    picomem_t  *dev = (picomem_t *) calloc(1, sizeof(picomem_t));
+    const char *fn;
+
+    dev->model     = (int) info->local;
+    dev->inst      = device_get_instance();
+    dev->base      = 0x2a0; /* Fixed on real hardware. */
+    dev->bios_addr = device_get_config_hex20("bios_addr");
+    dev->irq       = device_get_config_int("irq");
+
+    dev->max_pmram  = (dev->model == 2) ? 16 : 8;
+    dev->pmram_size = (uint32_t) dev->max_pmram << 14;
+    dev->pmram      = (uint8_t *) calloc(1, dev->pmram_size);
+    dev->psram      = (uint8_t *) calloc(1, PM_PSRAM_SIZE);
+
+    snprintf(dev->cfg_path, sizeof(dev->cfg_path), "picomem_%i.cfg", dev->inst);
+
+    fn = (dev->model == 2) ? PICOMEM_BIOS_PM2 : PICOMEM_BIOS_PM1;
+    memset(dev->rom, 0xff, PM_ROM_SIZE);
+    if (!rom_load_linear(fn, 0, PM_ROM_SIZE, 0, dev->rom))
+        picomem_log("PicoMEM: unable to load %s\n", fn);
+
+    pm_init_shared_ram(dev);
+
+    /* 16KB block mappings, all disabled until the BIOS asks for them. */
+    for (int i = 0; i < PM_NBLOCKS; i++) {
+        mem_mapping_add(&dev->blocks[i].mapping, (uint32_t) i << 14, 0x4000,
+                        pm_blk_read, pm_blk_readw, NULL,
+                        pm_blk_write, pm_blk_writew, NULL,
+                        NULL, MEM_MAPPING_EXTERNAL, &dev->blocks[i]);
+        mem_mapping_disable(&dev->blocks[i].mapping);
+    }
+
+    if (dev->bios_addr != 0) {
+        mem_mapping_add(&dev->rom_mapping, dev->bios_addr, PM_ROM_SIZE,
+                        pm_rom_read, pm_rom_readw, NULL,
+                        NULL, NULL, NULL,
+                        dev->rom, MEM_MAPPING_EXTERNAL | MEM_MAPPING_ROM, dev);
+        mem_mapping_add(&dev->ram_mapping, dev->bios_addr + PM_ROM_SIZE, PM_RAM_SIZE,
+                        pm_ram_read, pm_ram_readw, NULL,
+                        pm_ram_write, pm_ram_writew, NULL,
+                        dev->ram, MEM_MAPPING_EXTERNAL, dev);
+    }
+
+    io_sethandler(dev->base, 6,
+                  pm_io_read, NULL, NULL,
+                  pm_io_write, NULL, NULL, dev);
+
+    timer_add(&dev->poll_timer, pm_poll_timer, dev, 0);
+    timer_add(&dev->irq_timer, pm_irq_timer, dev, 0);
+
+    pm_set_status(dev, STAT_READY);
+
+    picomem_log("PicoMEM%s: port %03X, BIOS %05X, IRQ %d, config %s\n",
+                (dev->model == 2) ? " 2" : "", dev->base, dev->bios_addr, dev->irq,
+                dev->ram[BV_CFGInit] == INIT_DONE ? "loaded" : "default");
+
+    return dev;
+}
+
+static void
+picomem_close(void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    free(dev->pmram);
+    free(dev->psram);
+    free(dev);
+}
+
+static int
+picomem_available(void)
+{
+    return rom_present(PICOMEM_BIOS_PM1);
+}
+
+static int
+picomem2_available(void)
+{
+    return rom_present(PICOMEM_BIOS_PM2);
+}
+
+#define PICOMEM_BIOS_ADDR_CONFIG                         \
+    {                                                    \
+        .name           = "bios_addr",                   \
+        .description    = "BIOS address",                \
+        .type           = CONFIG_HEX20,                  \
+        .default_string = NULL,                          \
+        .default_int    = 0xd0000,                       \
+        .file_filter    = NULL,                          \
+        .spinner        = { 0 },                         \
+        .selection      = {                              \
+            { .description = "C800H", .value = 0xc8000 }, \
+            { .description = "CC00H", .value = 0xcc000 }, \
+            { .description = "D000H", .value = 0xd0000 }, \
+            { .description = "D400H", .value = 0xd4000 }, \
+            { .description = "D800H", .value = 0xd8000 }, \
+            { .description = "DC00H", .value = 0xdc000 }, \
+            { .description = "E000H", .value = 0xe0000 }, \
+            { .description = "E400H", .value = 0xe4000 }, \
+            { .description = ""                        }  \
+        },                                               \
+        .bios           = { { 0 } }                      \
+    }
+
+// clang-format off
+static const device_config_t picomem_config[] = {
+    PICOMEM_BIOS_ADDR_CONFIG,
+    {
+        .name           = "irq",
+        .description    = "IRQ",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 3,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "IRQ 2", .value = 2 },
+            { .description = "IRQ 3", .value = 3 },
+            { .description = "IRQ 5", .value = 5 },
+            { .description = "IRQ 7", .value = 7 },
+            { .description = ""                  }
+        },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
+
+static const device_config_t picomem2_config[] = {
+    PICOMEM_BIOS_ADDR_CONFIG,
+    {
+        .name           = "irq",
+        .description    = "IRQ",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 3,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "IRQ 3", .value = 3 },
+            { .description = "IRQ 5", .value = 5 },
+            { .description = "IRQ 6", .value = 6 },
+            { .description = "IRQ 7", .value = 7 },
+            { .description = ""                  }
+        },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
+// clang-format on
+
+const device_t picomem_device = {
+    .name          = "PicoMEM",
+    .internal_name = "picomem",
+    .flags         = DEVICE_ISA,
+    .local         = 1,
+    .init          = picomem_init,
+    .close         = picomem_close,
+    .reset         = picomem_reset,
+    .available     = picomem_available,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = picomem_config
+};
+
+const device_t picomem2_device = {
+    .name          = "PicoMEM 2",
+    .internal_name = "picomem2",
+    .flags         = DEVICE_ISA,
+    .local         = 2,
+    .init          = picomem_init,
+    .close         = picomem_close,
+    .reset         = picomem_reset,
+    .available     = picomem2_available,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = picomem2_config
+};
