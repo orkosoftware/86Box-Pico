@@ -39,4 +39,8 @@ typedef struct mmb_s {
     int     pos;
 } mmb_t;
 
+extern void    mmb_get_buffer(int32_t *buffer, uint16_t len, void *priv);
+extern void    mmb_write(uint16_t addr, uint8_t val, void *priv);
+extern uint8_t mmb_read(uint16_t addr, void *priv);
+
 #endif /* _SOUND_SND_MMB_H_ */

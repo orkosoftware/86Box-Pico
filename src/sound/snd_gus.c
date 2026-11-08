@@ -59,6 +59,7 @@
 #include <86box/rom.h>
 #include <86box/i2c.h>
 #include <86box/filters.h>
+#include <86box/snd_gus.h>
 
 #define GUS_PNP_ROM   "roms/sound/gravis/OLDGRAV.ROM" /* Gravis UltraSound PnP ROM, old with MPU401 IRQ */
 #define GUS_PNP_ROM_N "roms/sound/gravis/GRAVIS.ROM" /* Gravis UltraSound PnP ROM, new with no MPU401 IRQ */
@@ -218,6 +219,7 @@ typedef struct gus_t {
 
     uint8_t  irq_ctrl;
     uint8_t  dma_ctrl;
+    int      fixed_latches; /* IRQ and DMA are set by the host card, not port 2XB. */
 
     uint8_t sb_2xa;
     uint8_t sb_2xc;
@@ -1408,6 +1410,8 @@ gus_write(uint16_t addr, uint8_t val, void *priv)
             switch (gus->reg_ctrl & 0x07) {
                 case 0:
                     if (gus->type == GUS_INTERWAVE && !(gus->compat & 0x10))
+                        break;
+                    if (gus->fixed_latches)
                         break;
                     if (gus->latch_enable & 0x40) {
                         gus->irq_ctrl = val;
@@ -3059,7 +3063,7 @@ iw_put_buffer(int16_t *buffer, int len, void *priv)
     }
 }
 
-static void
+void
 gus_get_buffer(int32_t *buffer, uint16_t len, void *priv)
 {
     gus_t *gus = (gus_t *) priv;
@@ -3621,6 +3625,83 @@ gus_reset(void *priv)
     }
 
     gus_update_int_status(gus);
+}
+
+/* A plain 1 MB GF1 owned by another card. It starts switched off; the owner
+   mixes it with gus_get_buffer() while it has a port. */
+void *
+gus_embedded_init(void)
+{
+    gus_t *gus = calloc(1, sizeof(gus_t));
+
+    gus->log           = log_open("GUS");
+    gus->gus_end_ram   = 1 << 20;
+    gus->ram           = (uint8_t *) calloc(1, gus->gus_end_ram);
+    gus->type          = GUS_CLASSIC;
+    gus->jumper        = 0x06;
+    gus->fixed_latches = 1;
+    gus->irq = gus->irq_midi = gus->irq2 = -1;
+    gus->dma = gus->dma2 = -1;
+
+    timer_add(&gus->samp_timer, gus_poll_wave, gus, 0);
+    timer_add(&gus->timer_1, gus_poll_timer_1, gus, 0);
+    timer_add(&gus->timer_2, gus_poll_timer_2, gus, 0);
+    timer_add(&gus->sample_timer, gus_input_poll, gus, 0);
+
+    gus_reset(gus);
+
+    return gus;
+}
+
+/* 0 = off. The ports are the ones a GF1 needs: no MIDI, no 3X8-3XF, no 7X6. */
+void
+gus_embedded_set_port(void *priv, uint16_t port)
+{
+    gus_t *gus = (gus_t *) priv;
+
+    if (gus->base) {
+        io_removehandler(gus->base, 0x0010, gus_read, NULL, NULL, gus_write, NULL, NULL, gus);
+        io_removehandler(0x0102 + gus->base, 0x0006, gus_read, NULL, NULL, gus_write, NULL, NULL, gus);
+    }
+
+    if (port) {
+        io_sethandler(port, 0x0010, gus_read, NULL, NULL, gus_write, NULL, NULL, gus);
+        io_sethandler(0x0102 + port, 0x0006, gus_read, NULL, NULL, gus_write, NULL, NULL, gus);
+    }
+
+    if (port && !gus->base) {
+        gus_reset(gus);
+        gus->reset        = 0;
+        gus->latch_enable = 0;
+        gus->out_l = gus->out_r = 0;
+        gus->pos = 0;
+        timer_set_delay_u64(&gus->samp_timer, gus->samp_latch);
+        timer_set_delay_u64(&gus->timer_1, (uint64_t) (TIMER_USEC * 80));
+        timer_set_delay_u64(&gus->timer_2, (uint64_t) (TIMER_USEC * 320));
+    } else if (!port && gus->base) {
+        timer_disable(&gus->samp_timer);
+        timer_disable(&gus->timer_1);
+        timer_disable(&gus->timer_2);
+        timer_disable(&gus->sample_timer);
+        gus_reset(gus); /* Also lowers the IRQ line. */
+    }
+
+    gus->base = port;
+}
+
+void
+gus_embedded_set_irq_dma(void *priv, int irq, int dma)
+{
+    gus_t *gus = (gus_t *) priv;
+
+    if (gus->base && (gus->irq != -1) && (gus->irq != irq))
+        picintc(1 << gus->irq);
+
+    gus->irq = gus->irq_midi = gus->irq2 = irq;
+    gus->dma = gus->dma2 = dma;
+
+    if (gus->base)
+        gus_update_int_status(gus);
 }
 
 void *

@@ -38,7 +38,8 @@
  *          "<VM folder>/picomem/{FLOPPY,HDD}" folders through Int13h.
  *          Lo-tech compatible EMS (up to 4MB) from the PSRAM.
  *          USB mouse, MM58167 clock and game port.
- *          Not yet: NE2000, audio, EtherDFS.
+ *          Adlib, CMS, Tandy, Mindscape, Covox, Sound Blaster 2.0, GUS, MPU-401.
+ *          Not yet: other sound cards, NE2000, EtherDFS.
  *
  * Authors: Freddy VETELE (original PicoMEM hardware, firmware and BIOS)
  *
@@ -60,6 +61,16 @@
 #include <86box/pic.h>
 #include <86box/mouse.h>
 #include <86box/gameport.h>
+#include <86box/sound.h>
+#include <86box/snd_opl.h>
+#include <86box/snd_cms.h>
+#include <86box/snd_sn76489.h>
+#include "../sound/ayumi/ayumi.h"
+#include <86box/snd_mmb.h>
+#include <86box/filters.h>
+#include <86box/snd_sb.h>
+#include <86box/snd_gus.h>
+#include <86box/midi.h>
 #include <86box/plat.h>
 #include <86box/plat_dir.h>
 #include <86box/path.h>
@@ -133,6 +144,17 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define CMD_Keyb_OnOff    0x55
 #define CMD_Wifi_Infos    0x60
 #define CMD_USB_Status    0x61
+#define CMD_AudioOnOff    0x70
+#define CMD_AdlibOnOff    0x73
+#define CMD_TDYOnOff      0x74
+#define CMD_CMSOnOff      0x75
+#define CMD_CVXOnOff      0x76
+#define CMD_SetSBIRQDMA   0x77
+#define CMD_SBOnOff       0x78
+#define CMD_SetGUSIRQDMA  0x79
+#define CMD_GUSOnOff      0x7A
+#define CMD_MPUOnOff      0x7D
+#define CMD_MMBOnOff      0x7B
 #define CMD_DISK_Status   0x62
 #define CMD_HDD_Getlist   0x80
 #define CMD_HDD_Getinfos  0x81
@@ -150,6 +172,8 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define CMDERR_DISK      0x07
 #define CMDERR_FILEREAD  0x08
 #define CMDERR_MOUNTFAIL 0x09
+#define CMDERR_PORTUSED  0x10
+#define CMDERR_NOIRQ     0x13
 
 #define INIT_DONE     0x00
 #define INIT_SKIPPED  0xFC
@@ -215,6 +239,15 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 /* MM58167 clock registers, as wired on the AST SixPakPlus. */
 #define PM_RTC_PORT  0x2c0
 #define PM_RTC_SIZE  16
+#define PM_ADLIB_PORT 0x388
+#define PM_CMS_SIZE   16
+#define PM_TANDY_SIZE 2
+#define PM_MMB_SIZE   4
+#define PM_CVX_SIZE   8
+#define PM_SB_SIZE    16
+#define PM_GUS_SIZE   16 /* And 8 more at +100h. */
+#define PM_MPU_SIZE   8
+#define CVX_TYPE_STEREO 2
 #define RTC_MS       0x00
 #define RTC_HS       0x01
 #define RTC_SECONDS  0x02
@@ -240,6 +273,11 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define CFG_ENABLE_USB   210
 #define CFG_ENABLE_WIFI  214
 #define CFG_ENABLE_JOY   218
+#define CFG_AUDIO_OUT    224
+#define CFG_ADLIB        229
+#define CFG_TDY_PORT     230 /* u16 */
+#define CFG_CMS_PORT     232 /* u16 */
+#define CFG_MMB_PORT     238 /* u16 */
 #define CFG_USE_RTC      241
 #define CFG_NE2000_PORT  216
 #define CFG_B_MAX_PMRAM  220
@@ -376,6 +414,45 @@ typedef struct picomem_t {
     int64_t rtc_offset;              /* guest time minus host time, seconds */
     uint8_t rtc_ram[PM_RTC_SIZE];
     void   *gameport;
+
+    /* Sound cards, switched by CMD_DEV_Init or PMINIT. */
+    fm_drv_t  opl;
+    int       adlib_active;
+    cms_t     cms;
+    sn76489_t tandy;
+    mmb_t     mmb;
+    uint16_t  cms_port; /* 0 when off */
+    uint16_t  tandy_port;
+    uint16_t  mmb_port;
+
+    /* Covox on the parallel port address, turned on by PMINIT only. */
+    uint16_t cvx_port;
+    uint8_t  cvx_type;
+    uint8_t  cvx_channel;
+    uint8_t  cvx_right; /* sample */
+    uint8_t  cvx_left;  /* sampleleft */
+    int16_t  cvx_buffer[2][SOUNDBUFLEN];
+    int      cvx_pos;
+
+    /* Sound Blaster 2.0, turned on by PMINIT only. */
+    sb_dsp_t sb_dsp;
+    uint16_t sb_port;
+    uint8_t  sb_irq;
+    uint8_t  sb_dma;
+
+    /* Gravis UltraSound, 1 MB, turned on by PMINIT only. */
+    void    *gus;
+    uint16_t gus_port;
+
+    /* UART-only MPU-401, turned on by PMINIT only. */
+    uint16_t mpu_port;
+    uint8_t  mpu_status;
+    uint8_t  mpu_reset;
+    uint8_t  mpu_sysex;
+    uint8_t  mpu_in_msg;
+    uint8_t  mpu_len;
+    uint8_t  mpu_cnt;
+    uint8_t  mpu_msg[3];
 } picomem_t;
 
 /* The card that receives host mouse input, if the PicoMEM mouse is selected. */
@@ -1066,6 +1143,452 @@ pm_joystick_enable(picomem_t *dev, int on)
         return;
     gameport_remap(dev->gameport, on ? 0x201 : 0);
     picomem_log("PicoMEM: joystick %s\n", on ? "on" : "off");
+}
+
+/* ---------- Audio (dev_audiomix.cpp, dev_adlib.cpp) ---------- */
+
+static void
+pm_music_buffer(int32_t *buffer, uint16_t len, void *priv)
+{
+    picomem_t     *dev = (picomem_t *) priv;
+    const int32_t *opl;
+
+    if (!dev->adlib_active)
+        return;
+
+    opl = dev->opl.update(dev->opl.priv);
+    for (uint16_t c = 0; c < (len * 2); c++)
+        buffer[c] += opl[c];
+    dev->opl.reset_buffer(dev->opl.priv);
+}
+
+static void
+pm_adlib_enable(picomem_t *dev, int on)
+{
+    on = !!on;
+    if (on == dev->adlib_active)
+        return;
+    if (on)
+        io_sethandler(PM_ADLIB_PORT, 2,
+                      dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+    else
+        io_removehandler(PM_ADLIB_PORT, 2,
+                         dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+    dev->adlib_active = on;
+    picomem_log("PicoMEM: Adlib %s\n", on ? "on" : "off");
+}
+
+/* Covox (covox_dac.cpp): a DAC on the printer data port, updated as written. */
+static void
+pm_cvx_update(picomem_t *dev)
+{
+    const int16_t left  = (int16_t) ((int8_t) (dev->cvx_left ^ 0x80) * 0x40);
+    const int16_t right = (int16_t) ((int8_t) (dev->cvx_right ^ 0x80) * 0x40);
+
+    for (; dev->cvx_pos < sound_pos_global; dev->cvx_pos++) {
+        dev->cvx_buffer[0][dev->cvx_pos] = left;
+        dev->cvx_buffer[1][dev->cvx_pos] = right;
+    }
+}
+
+static void
+pm_cvx_write(uint16_t port, uint8_t val, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    switch (port & 3) {
+        case 0:
+            pm_cvx_update(dev);
+            if (dev->cvx_type != CVX_TYPE_STEREO)
+                dev->cvx_left = dev->cvx_right = val;
+            else if (dev->cvx_channel)
+                dev->cvx_left = val;
+            else
+                dev->cvx_right = val;
+            break;
+
+        case 2:
+            dev->cvx_channel = val & 0x01;
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* Called from the sound timer; the Tandy chip registers its own handler. */
+static void
+pm_sound_buffer(int32_t *buffer, uint16_t len, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    if (dev->cms_port)
+        cms_get_buffer(buffer, len, &dev->cms);
+    if (dev->mmb_port)
+        mmb_get_buffer(buffer, len, &dev->mmb);
+    if (dev->cvx_port) {
+        pm_cvx_update(dev);
+        for (uint16_t c = 0; c < len; c++) {
+            buffer[c * 2] += dev->cvx_buffer[0][c];
+            buffer[(c * 2) + 1] += dev->cvx_buffer[1][c];
+        }
+        dev->cvx_pos = 0;
+    }
+    if (dev->sb_port) {
+        sb_dsp_update(&dev->sb_dsp);
+        for (uint16_t c = 0; c < (len * 2); c += 2) {
+            /* As a Sound Blaster 2.0 without the CD interface mixer. */
+            const int32_t out = (int32_t) ((sb_iir(0, 0, (double) dev->sb_dsp.buffer[c]) / 1.3) / 3.0);
+
+            buffer[c] += out;
+            buffer[c + 1] += out;
+        }
+        dev->sb_dsp.pos = 0;
+    }
+    if (dev->gus_port)
+        gus_get_buffer(buffer, len, dev->gus);
+}
+
+/* The firmware's port table has one entry per 8 ports. */
+static int
+pm_ranges_clash(uint16_t a, int alen, uint16_t b, int blen)
+{
+    return (b != 0) && ((a >> 3) <= ((b + blen - 1) >> 3)) && ((b >> 3) <= ((a + alen - 1) >> 3));
+}
+
+static int
+pm_port_used(picomem_t *dev, uint16_t port, int len, uint16_t self)
+{
+    return pm_ranges_clash(port, len, dev->base, 6)
+        || (dev->rtc_active && pm_ranges_clash(port, len, PM_RTC_PORT, PM_RTC_SIZE))
+        || (dev->adlib_active && pm_ranges_clash(port, len, PM_ADLIB_PORT, 2))
+        || ((dev->cms_port != self) && pm_ranges_clash(port, len, dev->cms_port, PM_CMS_SIZE))
+        || ((dev->tandy_port != self) && pm_ranges_clash(port, len, dev->tandy_port, PM_TANDY_SIZE))
+        || ((dev->mmb_port != self) && pm_ranges_clash(port, len, dev->mmb_port, PM_MMB_SIZE))
+        || ((dev->cvx_port != self) && pm_ranges_clash(port, len, dev->cvx_port, PM_CVX_SIZE))
+        || ((dev->sb_port != self) && pm_ranges_clash(port, len, dev->sb_port, PM_SB_SIZE))
+        || ((dev->gus_port != self) && pm_ranges_clash(port, len, dev->gus_port, PM_GUS_SIZE))
+        || ((dev->gus_port != self) && dev->gus_port && pm_ranges_clash(port, len, dev->gus_port + 0x100, 8))
+        || ((dev->mpu_port != self) && pm_ranges_clash(port, len, dev->mpu_port, PM_MPU_SIZE));
+}
+
+/* For each card: 0 = off, 1 = default port, otherwise the port. Returns 0 if OK. */
+static uint8_t
+pm_cms_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x220;
+    if (port == dev->cms_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_CMS_SIZE, dev->cms_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->cms_port)
+        io_removehandler(dev->cms_port, PM_CMS_SIZE,
+                         cms_read, NULL, NULL, cms_write, NULL, NULL, &dev->cms);
+    else
+        memset(&dev->cms, 0x00, sizeof(cms_t));
+    if (port)
+        io_sethandler(port, PM_CMS_SIZE,
+                      cms_read, NULL, NULL, cms_write, NULL, NULL, &dev->cms);
+    dev->cms_port = port;
+    picomem_log("PicoMEM: CMS port %03X\n", port);
+    return 0;
+}
+
+static void
+pm_tandy_silence(picomem_t *dev)
+{
+    for (int i = 0; i < 4; i++)
+        sn76489_write(0, 0x9f | (i << 5), &dev->tandy);
+}
+
+static uint8_t
+pm_tandy_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x2c0;
+    if (port == dev->tandy_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_TANDY_SIZE, dev->tandy_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->tandy_port)
+        io_removehandler(dev->tandy_port, PM_TANDY_SIZE,
+                         NULL, NULL, NULL, sn76489_write, NULL, NULL, &dev->tandy);
+    pm_tandy_silence(dev);
+    if (port)
+        io_sethandler(port, PM_TANDY_SIZE,
+                      NULL, NULL, NULL, sn76489_write, NULL, NULL, &dev->tandy);
+    dev->tandy_port = port;
+    picomem_log("PicoMEM: Tandy port %03X\n", port);
+    return 0;
+}
+
+static void
+pm_mmb_clear(picomem_t *dev)
+{
+    memset(&dev->mmb, 0x00, sizeof(mmb_t));
+    ayumi_configure(&dev->mmb.first.chip, 0, MMB_CLOCK, MMB_FREQ);
+    ayumi_configure(&dev->mmb.second.chip, 0, MMB_CLOCK, MMB_FREQ);
+    for (uint8_t i = 0; i < 3; i++) {
+        ayumi_set_pan(&dev->mmb.first.chip, i, 0.5, 1);
+        ayumi_set_pan(&dev->mmb.second.chip, i, 0.5, 1);
+    }
+}
+
+static uint8_t
+pm_mmb_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x300;
+    if (port == dev->mmb_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_MMB_SIZE, dev->mmb_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->mmb_port)
+        io_removehandler(dev->mmb_port, PM_MMB_SIZE,
+                         mmb_read, NULL, NULL, mmb_write, NULL, NULL, &dev->mmb);
+    else
+        pm_mmb_clear(dev);
+    if (port)
+        io_sethandler(port, PM_MMB_SIZE,
+                      mmb_read, NULL, NULL, mmb_write, NULL, NULL, &dev->mmb);
+    dev->mmb_port = port;
+    picomem_log("PicoMEM: Mindscape port %03X\n", port);
+    return 0;
+}
+
+/* 0 = off, 1 = LPT1, 2 = LPT2, otherwise the port. */
+static uint8_t
+pm_cvx_enable(picomem_t *dev, uint8_t type, uint16_t port)
+{
+    if (port == 1)
+        port = 0x378;
+    else if (port == 2)
+        port = 0x278;
+    dev->cvx_type = type;
+    if (port == dev->cvx_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_CVX_SIZE, dev->cvx_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->cvx_port)
+        io_removehandler(dev->cvx_port, PM_CVX_SIZE,
+                         NULL, NULL, NULL, pm_cvx_write, NULL, NULL, dev);
+    if (port)
+        io_sethandler(port, PM_CVX_SIZE,
+                      NULL, NULL, NULL, pm_cvx_write, NULL, NULL, dev);
+    dev->cvx_left = dev->cvx_right = 0x80; /* Silence. */
+    dev->cvx_channel = 0;
+    dev->cvx_pos     = 0;
+    dev->cvx_port    = port;
+    picomem_log("PicoMEM: Covox port %03X type %d\n", port, type);
+    return 0;
+}
+
+/* dev_sbdsp.cpp. The DSP uses the PC's real DMA controller and IRQ line. */
+static uint8_t
+pm_sb_set_irq_dma(picomem_t *dev, uint8_t irq, uint8_t dma)
+{
+    dev->sb_irq = irq;
+    dev->sb_dma = dma;
+    return (irq == dev->ram[BV_IRQ]) ? 1 : 0;
+}
+
+static void
+pm_sb_opl_handlers(picomem_t *dev, uint16_t port, int on)
+{
+    if (on)
+        io_sethandler(port + 8, 2,
+                      dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+    else
+        io_removehandler(port + 8, 2,
+                         dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+}
+
+static uint8_t
+pm_sb_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x220;
+    if (port == dev->sb_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_SB_SIZE, dev->sb_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->sb_port) {
+        /* A DSP reset stops any transfer in progress. */
+        outb(dev->sb_port + 6, 1);
+        outb(dev->sb_port + 6, 0);
+        pm_sb_opl_handlers(dev, dev->sb_port, 0);
+    }
+    if (port) {
+        sb_dsp_setirq(&dev->sb_dsp, dev->sb_irq);
+        sb_dsp_setdma8(&dev->sb_dsp, dev->sb_dma);
+    }
+    sb_dsp_setaddr(&dev->sb_dsp, port);
+    if (port) {
+        pm_sb_opl_handlers(dev, port, 1);
+        pm_adlib_enable(dev, 1); /* The firmware adds the Adlib with the SB. */
+    }
+    dev->sb_dsp.pos = 0;
+    dev->sb_port    = port;
+    picomem_log("PicoMEM: Sound Blaster port %03X IRQ %d DMA %d\n", port, dev->sb_irq, dev->sb_dma);
+    return 0;
+}
+
+/* dev_gus.cpp. Like the SB, it uses the PC's real DMA controller and IRQ line. */
+static uint8_t
+pm_gus_set_irq_dma(picomem_t *dev, uint8_t irq, uint8_t dma)
+{
+    gus_embedded_set_irq_dma(dev->gus, irq, dma);
+    return (irq == dev->ram[BV_IRQ]) ? 1 : 0;
+}
+
+static uint8_t
+pm_gus_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x220;
+    if (port == dev->gus_port)
+        return 0;
+    if (port && (pm_port_used(dev, port, PM_GUS_SIZE, dev->gus_port)
+                 || pm_port_used(dev, port + 0x100, 8, dev->gus_port)))
+        return CMDERR_PORTUSED;
+
+    gus_embedded_set_port(dev->gus, port);
+    dev->gus_port = port;
+    picomem_log("PicoMEM: GUS port %03X\n", port);
+    return 0;
+}
+
+/* dev_mpu.cpp: a simple UART that drives the card's General MIDI synthesizer.
+   Here the notes go to whatever MIDI output 86Box is set to. As on the card,
+   SysEx is dropped and running status is not understood. */
+static void
+pm_mpu_send(picomem_t *dev)
+{
+    /* The card's synthesizer handles channel messages, bar polyphonic pressure. */
+    if ((dev->mpu_msg[0] >= 0xf0) || ((dev->mpu_msg[0] & 0xf0) == 0xa0))
+        return;
+
+    for (int i = 0; i <= dev->mpu_len; i++)
+        midi_raw_out_byte(dev->mpu_msg[i]);
+}
+
+static uint8_t
+pm_mpu_read(uint16_t port, void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    if (port == dev->mpu_port) {
+        dev->mpu_status |= 0x80;
+        dev->mpu_reset = 0;
+        return 0xfe; /* The only byte the card ever returns. */
+    }
+
+    return dev->mpu_status;
+}
+
+static void
+pm_mpu_write(uint16_t port, uint8_t val, void *priv)
+{
+    static const uint8_t lengths[8] = { 2, 2, 2, 2, 1, 1, 2, 0 };
+    picomem_t           *dev        = (picomem_t *) priv;
+
+    if (port == (dev->mpu_port + 1)) {
+        if (val == 0x3f)
+            dev->mpu_status &= ~0x80;
+        else if (val == 0xff) {
+            dev->mpu_reset  = 1; /* Until the acknowledge is read. */
+            dev->mpu_sysex  = 0;
+            dev->mpu_in_msg = 0;
+            dev->mpu_status &= ~0x80;
+        }
+        return;
+    }
+
+    if ((port != dev->mpu_port) || dev->mpu_reset)
+        return;
+
+    if (dev->mpu_sysex) {
+        if (val == 0xf7)
+            dev->mpu_sysex = 0;
+        return;
+    }
+    if (val == 0xf0) {
+        dev->mpu_sysex = 1;
+        return;
+    }
+
+    if (val >= 0x80) {
+        dev->mpu_len    = lengths[(val >> 4) - 8];
+        dev->mpu_in_msg = 1;
+        dev->mpu_cnt    = 0;
+    }
+
+    if (dev->mpu_in_msg) {
+        dev->mpu_msg[dev->mpu_cnt] = val;
+        if (dev->mpu_cnt == dev->mpu_len) {
+            dev->mpu_in_msg = 0;
+            pm_mpu_send(dev);
+        }
+        dev->mpu_cnt++;
+    }
+}
+
+static uint8_t
+pm_mpu_enable(picomem_t *dev, uint16_t port)
+{
+    if (port == 1)
+        port = 0x330;
+    if (port == dev->mpu_port)
+        return 0;
+    if (port && pm_port_used(dev, port, PM_MPU_SIZE, dev->mpu_port))
+        return CMDERR_PORTUSED;
+
+    if (dev->mpu_port) {
+        io_removehandler(dev->mpu_port, PM_MPU_SIZE,
+                         pm_mpu_read, NULL, NULL, pm_mpu_write, NULL, NULL, dev);
+        for (int ch = 0; ch < 16; ch++) { /* All sound off. */
+            midi_raw_out_byte(0xb0 | ch);
+            midi_raw_out_byte(120);
+            midi_raw_out_byte(0);
+        }
+    }
+    if (port) {
+        io_sethandler(port, PM_MPU_SIZE,
+                      pm_mpu_read, NULL, NULL, pm_mpu_write, NULL, NULL, dev);
+        dev->mpu_status = 0x80;
+        dev->mpu_reset  = 0;
+        dev->mpu_sysex  = 0;
+        dev->mpu_in_msg = 0;
+    }
+    dev->mpu_port = port;
+    picomem_log("PicoMEM: MPU port %03X\n", port);
+    return 0;
+}
+
+static uint16_t
+pm_cfg_word(picomem_t *dev, int offs)
+{
+    const uint8_t *cfg = pm_cfg(dev);
+
+    return cfg[offs] | (cfg[offs + 1] << 8);
+}
+
+/* PM_Audio_OnOff: the master switch applies the per-card settings. */
+static void
+pm_audio_enable(picomem_t *dev, int on)
+{
+    pm_adlib_enable(dev, on ? pm_cfg(dev)[CFG_ADLIB] : 0);
+    pm_cms_enable(dev, on ? pm_cfg_word(dev, CFG_CMS_PORT) : 0);
+    pm_tandy_enable(dev, on ? pm_cfg_word(dev, CFG_TDY_PORT) : 0);
+    pm_mmb_enable(dev, on ? pm_cfg_word(dev, CFG_MMB_PORT) : 0);
+    pm_sb_enable(dev, 0); /* Off at each boot; PMINIT turns it on. */
+    pm_gus_enable(dev, 0); /* The same. */
 }
 
 /* ---------- Disk images (pm_disk.cpp, dosbox/bios_disk.cpp) ---------- */
@@ -1947,8 +2470,12 @@ pm_exec_cmd(picomem_t *dev)
 
         case CMD_DEV_Init:
             dev->mouse_enabled = 0; /* Enabled later by PMMOUSE. */
-            pm_rtc_enable(dev, pm_cfg(dev)[CFG_USE_RTC]);
             pm_joystick_enable(dev, pm_cfg(dev)[CFG_ENABLE_JOY]);
+            pm_rtc_enable(dev, 0); /* The firmware sets up the clock after the audio. */
+            pm_audio_enable(dev, pm_cfg(dev)[CFG_AUDIO_OUT]);
+            if (pm_cfg(dev)[CFG_USE_RTC] && pm_ranges_clash(PM_RTC_PORT, PM_RTC_SIZE, dev->tandy_port, PM_TANDY_SIZE))
+                pm_tandy_enable(dev, 0);
+            pm_rtc_enable(dev, pm_cfg(dev)[CFG_USE_RTC]);
             /* TODO: (re)install NE2000, audio, RTC, joystick from config. */
             pm_pc_send(dev, PCC_EndCommand); /* PC_End() */
             break;
@@ -2048,6 +2575,75 @@ pm_exec_cmd(picomem_t *dev)
                 str[1] = (char) 0xfe;
             } else
                 dev->ram[PCCR_PARAM] = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_AudioOnOff:
+            pm_audio_enable(dev, dev->data_l);
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_AdlibOnOff:
+            pm_adlib_enable(dev, dev->data_l);
+            dev->data_l = 0;
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_TDYOnOff:
+            dev->data_l = pm_tandy_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_CMSOnOff:
+            dev->data_l = pm_cms_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_MMBOnOff:
+            dev->data_l = pm_mmb_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_CVXOnOff:
+            /* Low 10 bits: port or 0/1/2. Top 6 bits: the DAC type. */
+            dev->data_l = pm_cvx_enable(dev, dev->data_h >> 2, ((dev->data_h & 0x03) << 8) | dev->data_l);
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SetSBIRQDMA:
+            dev->data_l = pm_sb_set_irq_dma(dev, dev->data_l, dev->data_h);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SBOnOff:
+            if (dev->ram[BV_IRQ] == 0)
+                dev->data_l = CMDERR_NOIRQ;
+            else
+                dev->data_l = pm_sb_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_SetGUSIRQDMA:
+            dev->data_l = pm_gus_set_irq_dma(dev, dev->data_l, dev->data_h);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_GUSOnOff:
+            dev->data_l = pm_gus_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_h = 0;
+            pm_set_status(dev, STAT_READY);
+            break;
+
+        case CMD_MPUOnOff:
+            /* Low 10 bits: port or 0/1. Top 6 bits: a type the firmware ignores. */
+            dev->data_l = pm_mpu_enable(dev, ((dev->data_h & 0x03) << 8) | dev->data_l);
             pm_set_status(dev, STAT_READY);
             break;
 
@@ -2318,6 +2914,18 @@ picomem_init(const device_t *info)
 
     pm_set_status(dev, STAT_READY);
 
+    fm_driver_get(FM_YM3812, &dev->opl);
+    music_add_handler(pm_music_buffer, dev);
+    sn76489_init(&dev->tandy, 0, 0, SN76496, 3579545);
+    pm_tandy_silence(dev);
+    pm_mmb_clear(dev);
+    dev->cvx_left = dev->cvx_right = 0x80;
+    sb_dsp_init(&dev->sb_dsp, SB_DSP_201, SB_SUBTYPE_DEFAULT, dev);
+    dev->sb_irq = 7;
+    dev->sb_dma = 1;
+    dev->gus    = gus_embedded_init();
+    sound_add_handler(pm_sound_buffer, dev);
+
     /* The game port stays unmapped until the setup or PMINIT turns it on. */
     if (joystick_type[0] != JS_TYPE_NONE) {
         dev->gameport = gameport_add(&gameport_201_device);
@@ -2344,11 +2952,32 @@ picomem_close(void *priv)
         pm_disk_close(dev, i);
     pm_ems_remove(dev);
     pm_rtc_enable(dev, 0);
+    pm_adlib_enable(dev, 0);
+    pm_cms_enable(dev, 0);
+    pm_tandy_enable(dev, 0);
+    pm_mmb_enable(dev, 0);
+    pm_cvx_enable(dev, 0, 0);
+    pm_sb_enable(dev, 0);
+    sb_dsp_close(&dev->sb_dsp);
+    pm_gus_enable(dev, 0);
+    gus_close(dev->gus);
+    if (dev->mpu_port) /* The MIDI output may already be closed. */
+        io_removehandler(dev->mpu_port, PM_MPU_SIZE,
+                         pm_mpu_read, NULL, NULL, pm_mpu_write, NULL, NULL, dev);
     if (pm_mouse_card == dev)
         pm_mouse_card = NULL;
     free(dev->pmram);
     free(dev->psram);
     free(dev);
+}
+
+static void
+picomem_speed_changed(void *priv)
+{
+    picomem_t *dev = (picomem_t *) priv;
+
+    sb_dsp_speed_changed(&dev->sb_dsp);
+    gus_speed_changed(dev->gus);
 }
 
 static int
@@ -2441,7 +3070,7 @@ const device_t picomem_device = {
     .close         = picomem_close,
     .reset         = picomem_reset,
     .available     = picomem_available,
-    .speed_changed = NULL,
+    .speed_changed = picomem_speed_changed,
     .force_redraw  = NULL,
     .config        = picomem_config
 };
@@ -2455,7 +3084,7 @@ const device_t picomem2_device = {
     .close         = picomem_close,
     .reset         = picomem_reset,
     .available     = picomem2_available,
-    .speed_changed = NULL,
+    .speed_changed = picomem_speed_changed,
     .force_redraw  = NULL,
     .config        = picomem2_config
 };
