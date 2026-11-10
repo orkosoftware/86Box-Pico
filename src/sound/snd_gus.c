@@ -3690,6 +3690,14 @@ gus_embedded_set_port(void *priv, uint16_t port)
 }
 
 void
+gus_embedded_clear_ram(void *priv)
+{
+    gus_t *gus = (gus_t *) priv;
+
+    memset(gus->ram, 0x00, gus->gus_end_ram);
+}
+
+void
 gus_embedded_set_irq_dma(void *priv, int irq, int dma)
 {
     gus_t *gus = (gus_t *) priv;

@@ -102,6 +102,7 @@ static const NETWORK_CARD net_cards[] = {
     { &wd8003eb_device            },
     { &wd8013ebt_device           },
     { &picomem_ne2000_device      },
+    { &picogus_ne2000_device      },
     /* COM */
     { &modem_device               },
     /* LPT */

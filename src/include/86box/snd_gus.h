@@ -15,6 +15,7 @@
 extern void *gus_embedded_init(void);
 extern void  gus_embedded_set_port(void *priv, uint16_t port);
 extern void  gus_embedded_set_irq_dma(void *priv, int irq, int dma);
+extern void  gus_embedded_clear_ram(void *priv);
 extern void  gus_get_buffer(int32_t *buffer, uint16_t len, void *priv);
 extern void  gus_close(void *priv);
 extern void  gus_speed_changed(void *priv);

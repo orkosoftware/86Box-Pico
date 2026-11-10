@@ -49,6 +49,7 @@ add_library(snd OBJECT
     snd_cs423x.c
     snd_imfc.cpp
     snd_gus.c
+    snd_picogus.c
     snd_sb.c
     snd_sb_dsp.c
     snd_emu8k.c

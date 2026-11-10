@@ -18,6 +18,10 @@ extern "C" {
 extern const device_t picomem_device;
 extern const device_t picomem2_device;
 extern const device_t picomem_ne2000_device;
+extern const device_t picogus_ne2000_device;
+
+extern void *picogus_ne2k_instance(void);
+extern void  picogus_ne2k_map(void *priv, uint16_t port, uint8_t irq);
 
 #ifdef __cplusplus
 }

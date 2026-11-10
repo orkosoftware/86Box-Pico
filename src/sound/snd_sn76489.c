@@ -120,7 +120,7 @@ sn76489_update(sn76489_t *const sn76489)
     }
 }
 
-static void
+void
 sn76489_get_buffer(int32_t *buffer, uint16_t len, void *priv)
 {
     sn76489_t *const sn76489 = (sn76489_t *) priv;
@@ -242,13 +242,10 @@ sn76489_set_extra_divide(sn76489_t *sn76489, uint8_t enable)
     sn76489->extra_divide = enable;
 }
 
+/* For cards that mix the chip themselves with sn76489_get_buffer(). */
 void
-sn76489_init(sn76489_t *sn76489, uint16_t base, uint16_t size, int type, int freq)
+sn76489_init_embedded(sn76489_t *sn76489, int type, int freq)
 {
-    sn76489_log("sn76489_init: base=%04x, type=%d, freq=%d\n", base, type, freq);
-
-    sound_add_handler(sn76489_get_buffer, sn76489);
-
     if (type == SN76496) {
         sn76489->white_noise_tap_1 = 0;
         sn76489->white_noise_tap_2 = 1;
@@ -274,6 +271,16 @@ sn76489_init(sn76489_t *sn76489, uint16_t base, uint16_t size, int type, int fre
     sn76489->psgconst = (((double) freq / 64.0) / (double) FREQ_48000);
 
     sn76489_mute = 0;
+}
+
+void
+sn76489_init(sn76489_t *sn76489, uint16_t base, uint16_t size, int type, int freq)
+{
+    sn76489_log("sn76489_init: base=%04x, type=%d, freq=%d\n", base, type, freq);
+
+    sound_add_handler(sn76489_get_buffer, sn76489);
+
+    sn76489_init_embedded(sn76489, type, freq);
 
     if (base != 0x0000)
         io_sethandler(base, size,

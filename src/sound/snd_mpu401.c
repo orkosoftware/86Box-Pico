@@ -1679,6 +1679,13 @@ mpu401_setirq(mpu_t *mpu, int irq)
     mpu->irq = irq;
 }
 
+/* Power-on state, for cards that restart their MPU without the PC resetting. */
+void
+mpu401_reset_ext(mpu_t *mpu)
+{
+    MPU401_Reset(mpu);
+}
+
 void
 mpu401_change_addr(mpu_t *mpu, uint16_t addr)
 {

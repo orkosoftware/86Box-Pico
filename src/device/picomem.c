@@ -1322,7 +1322,9 @@ pm_sound_buffer(int32_t *buffer, uint16_t len, void *priv)
 
 /* The firmware's Wi-Fi NE2000 (ne2000/ne2000.c), on 86Box's network layer.
    Being a network card, it is chosen in the network settings along with how
-   it connects; the PicoMEM setup then gives it a port and an IRQ. */
+   it connects; the PicoMEM setup then gives it a port and an IRQ. The
+   PicoGUS NE2000 firmware (pg-ne2k.uf2) is the same code and uses it too,
+   as the "PicoGUS NE2000" network card. */
 #define PM_NE2K_SIZE 32
 
 typedef struct pm_ne2k_t {
@@ -1331,7 +1333,8 @@ typedef struct pm_ne2k_t {
     uint8_t   irq;
 } pm_ne2k_t;
 
-static pm_ne2k_t *pm_ne2k = NULL;
+static pm_ne2k_t *pm_ne2k = NULL;    /* PicoMEM */
+static pm_ne2k_t *pg_ne2k_inst = NULL; /* PicoGUS */
 
 static int
 pm_ne2k_selected(void)
@@ -1456,8 +1459,28 @@ pm_ne2k_port(void)
     return pm_ne2k ? pm_ne2k->port : 0;
 }
 
+/* For the PicoGUS: its NE2000 network card, if one is configured. */
+void *
+picogus_ne2k_instance(void)
+{
+    return pg_ne2k_inst;
+}
+
+void
+picogus_ne2k_map(void *priv, uint16_t port, uint8_t irq)
+{
+    pm_ne2k_t *ne = (pm_ne2k_t *) priv;
+
+    if (ne == NULL)
+        return;
+    if ((port != ne->port) || (irq != ne->irq))
+        pm_ne2k_map(ne, port, irq);
+    if (port)
+        pm_ne2k_chip_reset(ne);
+}
+
 static void *
-picomem_ne2000_init(UNUSED(const device_t *info))
+picomem_ne2000_init(const device_t *info)
 {
     pm_ne2k_t *ne = (pm_ne2k_t *) calloc(1, sizeof(pm_ne2k_t));
     dp8390_t  *dp;
@@ -1486,7 +1509,10 @@ picomem_ne2000_init(UNUSED(const device_t *info))
     pm_ne2k_chip_reset(ne);
     dp->card = network_attach(dp, dp->physaddr, dp8390_rx, NULL);
 
-    if (pm_ne2k == NULL)
+    if (info->local == 1) {
+        if (pg_ne2k_inst == NULL)
+            pg_ne2k_inst = ne;
+    } else if (pm_ne2k == NULL)
         pm_ne2k = ne;
 
     return ne;
@@ -1502,6 +1528,8 @@ picomem_ne2000_close(void *priv)
                          pm_ne2k_read, NULL, NULL, pm_ne2k_write, NULL, NULL, ne);
     if (pm_ne2k == ne)
         pm_ne2k = NULL;
+    if (pg_ne2k_inst == ne)
+        pg_ne2k_inst = NULL;
     free(ne);
 }
 
@@ -1525,6 +1553,20 @@ const device_t picomem_ne2000_device = {
     .internal_name = "picomem_ne2000",
     .flags         = DEVICE_ISA,
     .local         = 0,
+    .init          = picomem_ne2000_init,
+    .close         = picomem_ne2000_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = picomem_ne2000_config
+};
+
+const device_t picogus_ne2000_device = {
+    .name          = "PicoGUS NE2000 (Wi-Fi firmware)",
+    .internal_name = "picogus_ne2000",
+    .flags         = DEVICE_ISA,
+    .local         = 1,
     .init          = picomem_ne2000_init,
     .close         = picomem_ne2000_close,
     .reset         = NULL,

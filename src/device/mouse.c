@@ -30,6 +30,7 @@
 #include <86box/timer.h>
 #include <86box/gdbstub.h>
 #include <86box/mouse.h>
+#include <86box/snd_picogus.h>
 #include <86box/video.h>
 #include <86box/plat.h>
 #include <86box/plat_unused.h>
@@ -124,6 +125,7 @@ static mouse_t mouse_devices[] = {
     { &mouse_ps2_device                },
     { &mouse_usb_device                },
     { &mouse_picomem_device            },
+    { &mouse_picogus_device            },
 #ifdef USE_STANDALONE_QUICKPORT
     { &mouse_upc_standalone_device     },
 #endif

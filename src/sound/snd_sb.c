@@ -522,7 +522,7 @@ sbpro_filter_cd_audio(int channel, double *buffer, void *priv)
     *buffer = c;
 }
 
-static void
+void
 sb_get_buffer_sb16_awe32(int32_t *buffer, uint16_t len, void *priv)
 {
     sb_t                    *sb    = (sb_t *) priv;
@@ -1194,7 +1194,7 @@ sb_put_buffer_sb16_awe32(int16_t *buffer, int len, void *priv)
     }
 }
 
-static void
+void
 sb_get_music_buffer_sb16_awe32(int32_t *buffer, const uint16_t len, void *priv)
 {
     sb_t                    *sb          = (sb_t *) priv;

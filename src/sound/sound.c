@@ -33,6 +33,7 @@
 #include <86box/snd_ac97.h>
 #include <86box/timer.h>
 #include <86box/snd_mpu401.h>
+#include <86box/snd_picogus.h>
 #include <86box/sound.h>
 #include <86box/fdd_audio.h>
 #include <86box/hdd_audio.h>
@@ -214,6 +215,7 @@ static const SOUND_CARD sound_cards[] = {
     { &gus_device                   },
     { &gus_v34_device               },
     { &gus_v37_device               },
+    { &picogus_device               },
     { &gus_max_device               },
     { &gus_ace_device               },
     { &gus_extreme_device           },

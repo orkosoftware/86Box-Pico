@@ -22,4 +22,9 @@ extern const device_t mke_cdrom_noncreative_device;
 extern const device_t teac_cdrom_device;
 extern const device_t teac_cdrom_16bit_device;
 
+extern int   mke_embedded_active;
+extern void *mke_embedded_init(void);
+extern void  mke_embedded_set_base(void *priv, uint16_t old_base, uint16_t base);
+extern void  mke_embedded_close(void *priv);
+
 #endif /*CDROM_MKE_H*/

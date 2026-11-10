@@ -25,6 +25,7 @@ extern "C" {
 #include <86box/cassette.h>
 #include <86box/cdrom.h>
 #include <86box/cdrom_interface.h>
+#include <86box/cdrom_mke.h>
 #include <86box/fdd.h>
 #include <86box/lpt.h>
 #include <86box/hdc.h>
@@ -508,6 +509,8 @@ MachineStatus::iterateCDROM(const std::function<void(int)> &cb)
             (scsi_card_current[2] == 0) && (scsi_card_current[3] == 0))
             continue;
         if ((cdrom[i].bus_type == CDROM_BUS_SONY || cdrom[i].bus_type == CDROM_BUS_CM100 || cdrom[i].bus_type == CDROM_BUS_PHILIPS || cdrom[i].bus_type == CDROM_BUS_HITACHI || cdrom[i].bus_type == CDROM_BUS_MITSUMI || cdrom[i].bus_type == CDROM_BUS_MKE) && (cdrom_interface_current == 0) &&
+            /* The PicoGUS has its own MKE interface. */
+            !((cdrom[i].bus_type == CDROM_BUS_MKE) && mke_embedded_active) &&
             !((cdrom[i].bus_type == CDROM_BUS_MITSUMI) && (machines[machine].init == machine_at_tandy_vis_init)) &&
             /* A Mitsumi drive behind a parallel port pod has no card either. */
             !((cdrom[i].bus_type == CDROM_BUS_MITSUMI) && (cdrom[i].priv != NULL)))

@@ -191,6 +191,7 @@ extern void    mpu401_write(uint16_t addr, uint8_t val, void *priv);
 extern uint8_t mpu401_read(uint16_t addr, void *priv);
 extern void    mpu401_setirq(mpu_t *mpu, int irq);
 extern void    mpu401_change_addr(mpu_t *mpu, uint16_t addr);
+extern void    mpu401_reset_ext(mpu_t *mpu);
 extern void    mpu401_init(mpu_t *mpu, uint16_t addr, int irq, int mode, int receive_input);
 extern void    mpu401_device_add(void);
 extern void    mpu401_irq_attach(mpu_t *mpu, void (*ext_irq_update)(void *priv, int set), int (*ext_irq_pending)(void *priv), void *priv);

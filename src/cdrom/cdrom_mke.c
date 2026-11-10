@@ -188,6 +188,8 @@ typedef struct mke_t {
     uint8_t    is_error;
     uint8_t    sense[8];
 
+    uint8_t    pad_version; /* PicoGUS: version padded to the 12 bytes SB2CD reads. */
+
     uint8_t    temp_buf[65536];
 } mke_t;
 
@@ -196,6 +198,7 @@ typedef struct mke_interface_t {
 
     uint8_t    is_sb;
     uint8_t    word_data;
+    uint8_t    data_port2; /* PicoGUS (mke/mke.c): data at +2 as well, SB-style select. */
     uint8_t    has_teac;
     uint8_t    has_family2;
 
@@ -1868,6 +1871,10 @@ mke_command(mke_t *mke, uint8_t value)
                 /* SB2CD Expects 12 bytes, but drive only returns 11. */
                 fifo8_reset(&mke->info_fifo);
                 fifo8_push_all(&mke->info_fifo, (uint8_t *) mke->ver, 10);
+                if (mke->pad_version) {
+                    fifo8_push(&mke->info_fifo, 0x00);
+                    fifo8_push(&mke->info_fifo, 0x00);
+                }
                 fifo8_push(&mke->info_fifo, mke_cdrom_status(mke->cdrom_dev, mke));
                 break;
             case CMD1_STATUS:
@@ -1970,7 +1977,7 @@ mke_read(uint16_t port, void *priv)
             break;
         case 2:
             /* Data */
-            if (!mki->is_sb)
+            if (!mki->is_sb || mki->data_port2)
                 ret = mke_read_data(mke);
             break;
         default:
@@ -2030,8 +2037,11 @@ mke_close(void *priv)
     free(mki);
 }
 
-void *
-mke_init(const device_t *info)
+/* Set while a card with its own MKE interface (the PicoGUS) is present. */
+int mke_embedded_active = 0;
+
+static mke_interface_t *
+mke_interface_new(int is_sb, int word_data)
 {
     mke_interface_t *mki = (mke_interface_t *) calloc(1, sizeof(mke_interface_t));
     int              num = 0;
@@ -2096,13 +2106,51 @@ mke_init(const device_t *info)
         }
     }
 
-    mki->is_sb                  = info->local & 1;
-    mki->word_data              = info->local & 2;
+    mki->is_sb     = is_sb;
+    mki->word_data = word_data;
+
+    return mki;
+}
+
+void *
+mke_init(const device_t *info)
+{
+    mke_interface_t *mki = mke_interface_new(info->local & 1, info->local & 2);
 
     uint16_t base = device_get_config_hex16("base");
     io_sethandler(base, 4, mke_read, mki->word_data ? mke_readw : NULL, NULL, mke_write, NULL, NULL, mki);
 
     return mki;
+}
+
+/* An MKE interface owned by another card, which moves it with
+   mke_embedded_set_base() (0 = off) and frees it with mke_embedded_close(). */
+void *
+mke_embedded_init(void)
+{
+    mke_interface_t *mki = mke_interface_new(1, 0);
+
+    mki->data_port2     = 1;
+    for (int i = 0; i < 4; i++)
+        mki->mke[i].pad_version = 1;
+    mke_embedded_active = 1;
+    return mki;
+}
+
+void
+mke_embedded_set_base(void *priv, uint16_t old_base, uint16_t base)
+{
+    if (old_base)
+        io_removehandler(old_base, 4, mke_read, NULL, NULL, mke_write, NULL, NULL, priv);
+    if (base)
+        io_sethandler(base, 4, mke_read, NULL, NULL, mke_write, NULL, NULL, priv);
+}
+
+void
+mke_embedded_close(void *priv)
+{
+    mke_embedded_active = 0;
+    mke_close(priv);
 }
 
 static const device_config_t mke_config[] = {

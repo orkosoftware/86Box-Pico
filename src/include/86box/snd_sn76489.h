@@ -55,6 +55,8 @@ typedef struct sn76489_s {
 } sn76489_t;
 
 extern void sn76489_init(sn76489_t *sn76489, uint16_t base, uint16_t size, int type, int freq);
+extern void sn76489_init_embedded(sn76489_t *sn76489, int type, int freq);
+extern void sn76489_get_buffer(int32_t *buffer, uint16_t len, void *priv);
 extern void sn76489_write(uint16_t port, uint8_t data, void *priv);
 extern void sn76489_set_extra_divide(sn76489_t *sn76489, uint8_t enable);
 
