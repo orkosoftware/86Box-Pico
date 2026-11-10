@@ -17,6 +17,7 @@ extern "C" {
 
 extern const device_t picomem_device;
 extern const device_t picomem2_device;
+extern const device_t picomem_ne2000_device;
 
 #ifdef __cplusplus
 }

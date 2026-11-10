@@ -934,9 +934,11 @@ machine_tandy1k_init(const machine_t *model, int type)
      */
     dev->base = (mem_size - 128) * 1024;
     dev->mask = 0x1ffff;
+    /* Not MEM_MAPPING_INTERNAL: the BIOS moves this block above any expansion RAM,
+       which can take it past the end of the machine's own memory. */
     mem_mapping_add(&dev->ram_mapping, 0x60000, 0x20000,
                     read_ram, NULL, NULL, write_ram, NULL, NULL, NULL,
-                    MEM_MAPPING_INTERNAL, dev);
+                    0, dev);
     mem_mapping_set_addr(&ram_low_mapping, 0, dev->base);
 
     device_add(&kbc_tandy_device);

@@ -38,8 +38,10 @@
  *          "<VM folder>/picomem/{FLOPPY,HDD}" folders through Int13h.
  *          Lo-tech compatible EMS (up to 4MB) from the PSRAM.
  *          USB mouse, MM58167 clock and game port.
- *          Adlib, CMS, Tandy, Mindscape, Covox, Sound Blaster 2.0, GUS, MPU-401.
- *          Not yet: other sound cards, NE2000, EtherDFS.
+ *          Adlib, CMS, Tandy, Mindscape, Covox, Sound Blaster 2.0, and on the
+ *          PicoMEM 2 only GUS and MPU-401.
+ *          NE2000, on 86Box's network layer instead of Wi-Fi.
+ *          Not yet: other sound cards, EtherDFS.
  *
  * Authors: Freddy VETELE (original PicoMEM hardware, firmware and BIOS)
  *
@@ -48,6 +50,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #define HAVE_STDARG_H
@@ -71,6 +74,11 @@
 #include <86box/snd_sb.h>
 #include <86box/snd_gus.h>
 #include <86box/midi.h>
+#include <86box/random.h>
+#include <86box/thread.h>
+#include <86box/network.h>
+#include <86box/net_dp8390.h>
+#include <86box/plat_unused.h>
 #include <86box/plat.h>
 #include <86box/plat_dir.h>
 #include <86box/path.h>
@@ -185,6 +193,8 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define MEM_DISK  2
 #define MEM_BIOS  8
 #define MEM_PSRAM 16
+#define SMEM_RAM      32
+#define SMEM_VID      33
 #define MEM_EMS   17
 
 /* Shared RAM layout (pm_defines.h). */
@@ -240,11 +250,14 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define PM_RTC_PORT  0x2c0
 #define PM_RTC_SIZE  16
 #define PM_ADLIB_PORT 0x388
+#define PM_OPL_PORTS(dev) (((dev)->model == 2) ? 4 : 2) /* The PicoMEM 2 has an OPL3. */
 #define PM_CMS_SIZE   16
 #define PM_TANDY_SIZE 2
 #define PM_MMB_SIZE   4
 #define PM_CVX_SIZE   8
 #define PM_SB_SIZE    16
+/* The PicoMEM 1 firmware is built with USE_GUS=0 and USE_MPU=0. */
+#define PM_HAS_GUS_MPU(dev) ((dev)->model == 2)
 #define PM_GUS_SIZE   16 /* And 8 more at +100h. */
 #define PM_MPU_SIZE   8
 #define CVX_TYPE_STEREO 2
@@ -279,6 +292,7 @@ static const uint32_t pm_ems_frames[] = { 0xd0000, 0xe0000 };
 #define CFG_CMS_PORT     232 /* u16 */
 #define CFG_MMB_PORT     238 /* u16 */
 #define CFG_USE_RTC      241
+#define CFG_NE2000_IRQ   215
 #define CFG_NE2000_PORT  216
 #define CFG_B_MAX_PMRAM  220
 #define CFG_PREBOOT      222
@@ -373,6 +387,7 @@ typedef struct picomem_t {
     uint32_t   pmram_size;
     uint8_t   *psram;      /* 8MB PSRAM */
     int        max_pmram;  /* in 16KB blocks */
+    int        tandy_ram;  /* 0: no Tandy mode, 1: mode only, else KB to add */
     pm_block_t blocks[PM_NBLOCKS];
 
     /* EMS */
@@ -707,6 +722,62 @@ pm_ems_install(picomem_t *dev, uint16_t port, uint32_t frame)
     dev->ram[BV_SPIPSRAM]  = 1;
     dev->ram[BV_Int13hCLI] = 1;
     picomem_log("PicoMEM: EMS port %03X, frame %05X\n", port, frame);
+}
+
+/* CMD_TDY_Init: put the card's RAM at the bottom of the address space. The
+   Tandy BIOS then finds it on the next boot and moves the motherboard's RAM
+   above it, and the PicoMEM BIOS reboots straight after this command. */
+static void
+pm_tandy_ram_init(picomem_t *dev)
+{
+    uint8_t *map       = &pm_cfg(dev)[CFG_MEM_MAP];
+    int      pc_blocks = (dev->ram[PC_MEM] | (dev->ram[PC_MEM + 1] << 8)) / 16;
+    int      blocks    = dev->ram[BV_TdyRAM];
+    int      low_blocks;
+
+    if ((pc_blocks + blocks) > 40) {
+        blocks              = (pc_blocks < 40) ? (40 - pc_blocks) : 0;
+        dev->ram[BV_TdyRAM] = blocks;
+    }
+    if (blocks == 0)
+        return;
+
+    picomem_log("PicoMEM: Tandy RAM, %d KB added below %d KB\n", blocks * 16, pc_blocks * 16);
+
+    /* A real Tandy moves its own RAM above the card. 86Box only models that for
+       the top block (port A0h), so the fixed low part is moved here. */
+    low_blocks = (int) (ram_low_mapping.size >> 14);
+    mem_set_mem_state_both(0, (uint32_t) (blocks + low_blocks) << 14, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+    for (int i = 0; i < low_blocks; i++)
+        pm_block_set(dev, blocks + i, SMEM_RAM, ram + ((uint32_t) i << 14));
+
+
+    for (int i = 0; (i < blocks) && (i < dev->max_pmram); i++)
+        pm_block_set(dev, i, MEM_RAM, dev->pmram + ((uint32_t) i << 14));
+    for (int i = 0; i < dev->max_pmram; i++)
+        map[i] = MEM_RAM;
+
+    /* Only the PicoMEM 1 firmware goes on to PSRAM (USE_SPI_PSRAM). */
+    if ((dev->model != 2) && (blocks > dev->max_pmram)) {
+        for (int i = dev->max_pmram; i < blocks; i++) {
+            pm_block_set(dev, i, MEM_PSRAM, dev->psram + ((uint32_t) i << 14));
+            map[i] = MEM_PSRAM;
+        }
+        dev->ram[BV_SPIPSRAM]  = 1;
+        dev->ram[BV_Int13hCLI] = 1;
+    }
+
+    /* The BIOS is still running on a stack in this range, and only reboots once
+       the command returns. A real Tandy keeps answering here until that reboot. */
+    for (int i = 0; i < blocks; i++) {
+        if ((dev->blocks[i].ptr != NULL) && ((((uint32_t) i + 1) << 14) <= ((uint32_t) mem_size << 10)))
+            memcpy(dev->blocks[i].ptr, ram + ((uint32_t) i << 14), 0x4000);
+    }
+
+    /* The system RAM's new place in the map. */
+    for (int i = blocks; i < (blocks + pc_blocks); i++)
+        map[i] = SMEM_RAM;
+    map[blocks + pc_blocks] = SMEM_VID;
 }
 
 /* dev_memory_install_all(): map RAM/PSRAM according to the config MEM_Map. */
@@ -1169,10 +1240,10 @@ pm_adlib_enable(picomem_t *dev, int on)
     if (on == dev->adlib_active)
         return;
     if (on)
-        io_sethandler(PM_ADLIB_PORT, 2,
+        io_sethandler(PM_ADLIB_PORT, PM_OPL_PORTS(dev),
                       dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
     else
-        io_removehandler(PM_ADLIB_PORT, 2,
+        io_removehandler(PM_ADLIB_PORT, PM_OPL_PORTS(dev),
                          dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
     dev->adlib_active = on;
     picomem_log("PicoMEM: Adlib %s\n", on ? "on" : "off");
@@ -1249,6 +1320,220 @@ pm_sound_buffer(int32_t *buffer, uint16_t len, void *priv)
         gus_get_buffer(buffer, len, dev->gus);
 }
 
+/* The firmware's Wi-Fi NE2000 (ne2000/ne2000.c), on 86Box's network layer.
+   Being a network card, it is chosen in the network settings along with how
+   it connects; the PicoMEM setup then gives it a port and an IRQ. */
+#define PM_NE2K_SIZE 32
+
+typedef struct pm_ne2k_t {
+    dp8390_t *dp8390;
+    uint16_t  port;
+    uint8_t   irq;
+} pm_ne2k_t;
+
+static pm_ne2k_t *pm_ne2k = NULL;
+
+static int
+pm_ne2k_selected(void)
+{
+    for (int i = 0; i < NET_CARD_MAX; i++)
+        if (network_dev_available(i)
+            && (network_card_getdevice(net_cards_conf[i].device_num) == &picomem_ne2000_device))
+            return 1;
+
+    return 0;
+}
+
+static void
+pm_ne2k_interrupt(void *priv, int set)
+{
+    const pm_ne2k_t *ne = (pm_ne2k_t *) priv;
+
+    if (!ne->irq)
+        return;
+    if (set)
+        picint(1 << ne->irq);
+    else
+        picintc(1 << ne->irq);
+}
+
+static void
+pm_ne2k_chip_reset(pm_ne2k_t *ne)
+{
+    dp8390_reset(ne->dp8390);
+
+    /* The firmware's PROM: the address is not doubled, then 'W' from 12 on. */
+    memset(&ne->dp8390->macaddr[6], 0x00, 6);
+    memset(&ne->dp8390->macaddr[12], 0x57, 20);
+}
+
+/* The data port is always one byte per access, as the card is 8-bit only. */
+static void
+pm_ne2k_dma_step(pm_ne2k_t *ne)
+{
+    dp8390_t *dp = ne->dp8390;
+
+    dp->remote_dma++;
+    if (dp->remote_dma == (dp->page_stop << 8))
+        dp->remote_dma = dp->page_start << 8;
+
+    dp->remote_bytes = (dp->remote_bytes > 1) ? (dp->remote_bytes - 1) : 0;
+
+    if (dp->remote_bytes == 0) {
+        dp->ISR.rdma_done = 1;
+        if (dp->IMR.rdma_inte)
+            pm_ne2k_interrupt(ne, 1);
+    }
+}
+
+static uint8_t
+pm_ne2k_read(uint16_t port, void *priv)
+{
+    pm_ne2k_t *ne  = (pm_ne2k_t *) priv;
+    dp8390_t  *dp  = ne->dp8390;
+    uint16_t   off = (port - ne->port) & 0x1f;
+    uint8_t    ret = 0x00;
+
+    if (off == 0x1f)
+        pm_ne2k_chip_reset(ne);
+    else if (off >= 0x10) {
+        ret = dp8390_chipmem_read(dp, dp->remote_dma, 1);
+        pm_ne2k_dma_step(ne);
+    } else if (off == 0x00)
+        ret = dp8390_read_cr(dp);
+    else if (dp->CR.pgsel == 0)
+        ret = dp8390_page0_read(dp, off, 1);
+    else if (dp->CR.pgsel == 1)
+        ret = dp8390_page1_read(dp, off, 1);
+    else if (dp->CR.pgsel == 2)
+        ret = dp8390_page2_read(dp, off, 1);
+
+    return ret;
+}
+
+static void
+pm_ne2k_write(uint16_t port, uint8_t val, void *priv)
+{
+    pm_ne2k_t *ne  = (pm_ne2k_t *) priv;
+    dp8390_t  *dp  = ne->dp8390;
+    uint16_t   off = (port - ne->port) & 0x1f;
+
+    if (off >= 0x10) {
+        if (dp->remote_bytes != 0) {
+            dp8390_chipmem_write(dp, dp->remote_dma, val, 1);
+            pm_ne2k_dma_step(ne);
+        }
+    } else if (off == 0x00)
+        dp8390_write_cr(dp, val);
+    else if (dp->CR.pgsel == 0)
+        dp8390_page0_write(dp, off, val, 1);
+    else if (dp->CR.pgsel == 1)
+        dp8390_page1_write(dp, off, val, 1);
+    else if (dp->CR.pgsel == 2)
+        dp8390_page2_write(dp, off, val, 1);
+}
+
+static void
+pm_ne2k_map(pm_ne2k_t *ne, uint16_t port, uint8_t irq)
+{
+    if (ne->port) {
+        io_removehandler(ne->port, PM_NE2K_SIZE,
+                         pm_ne2k_read, NULL, NULL, pm_ne2k_write, NULL, NULL, ne);
+        if (ne->irq)
+            picintc(1 << ne->irq);
+    }
+    if (port)
+        io_sethandler(port, PM_NE2K_SIZE,
+                      pm_ne2k_read, NULL, NULL, pm_ne2k_write, NULL, NULL, ne);
+    ne->port = port;
+    ne->irq  = irq;
+    picomem_log("PicoMEM: NE2000 port %03X, IRQ %d\n", port, irq);
+}
+
+static uint16_t
+pm_ne2k_port(void)
+{
+    return pm_ne2k ? pm_ne2k->port : 0;
+}
+
+static void *
+picomem_ne2000_init(UNUSED(const device_t *info))
+{
+    pm_ne2k_t *ne = (pm_ne2k_t *) calloc(1, sizeof(pm_ne2k_t));
+    dp8390_t  *dp;
+    uint32_t   mac;
+
+    dp            = device_add_inst(&dp8390_device, dp3890_inst++);
+    ne->dp8390    = dp;
+    dp->priv      = ne;
+    dp->interrupt = pm_ne2k_interrupt;
+    dp8390_set_defaults(dp, DP8390_FLAG_CHECK_CR | DP8390_FLAG_CLEAR_IRQ);
+    dp->macaddr_size = 32;
+    dp8390_mem_alloc(dp, 0x4000, 0x8000); /* BX_NE2K_MEMSIZ */
+
+    mac = device_get_config_mac("mac", -1);
+    if (mac & 0xff000000) {
+        mac = (random_generate() << 16) | (random_generate() << 8) | random_generate();
+        device_set_config_mac("mac", mac);
+    }
+    dp->physaddr[0] = 0x00; /* 00:86:B0 (86Box OID) */
+    dp->physaddr[1] = 0x86;
+    dp->physaddr[2] = 0xb0;
+    dp->physaddr[3] = (mac >> 16) & 0xff;
+    dp->physaddr[4] = (mac >> 8) & 0xff;
+    dp->physaddr[5] = mac & 0xff;
+
+    pm_ne2k_chip_reset(ne);
+    dp->card = network_attach(dp, dp->physaddr, dp8390_rx, NULL);
+
+    if (pm_ne2k == NULL)
+        pm_ne2k = ne;
+
+    return ne;
+}
+
+static void
+picomem_ne2000_close(void *priv)
+{
+    pm_ne2k_t *ne = (pm_ne2k_t *) priv;
+
+    if (ne->port)
+        io_removehandler(ne->port, PM_NE2K_SIZE,
+                         pm_ne2k_read, NULL, NULL, pm_ne2k_write, NULL, NULL, ne);
+    if (pm_ne2k == ne)
+        pm_ne2k = NULL;
+    free(ne);
+}
+
+static const device_config_t picomem_ne2000_config[] = {
+    {
+        .name           = "mac",
+        .description    = "MAC Address",
+        .type           = CONFIG_MAC,
+        .default_string = NULL,
+        .default_int    = -1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+};
+
+const device_t picomem_ne2000_device = {
+    .name          = "PicoMEM NE2000",
+    .internal_name = "picomem_ne2000",
+    .flags         = DEVICE_ISA,
+    .local         = 0,
+    .init          = picomem_ne2000_init,
+    .close         = picomem_ne2000_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = picomem_ne2000_config
+};
+
 /* The firmware's port table has one entry per 8 ports. */
 static int
 pm_ranges_clash(uint16_t a, int alen, uint16_t b, int blen)
@@ -1261,7 +1546,7 @@ pm_port_used(picomem_t *dev, uint16_t port, int len, uint16_t self)
 {
     return pm_ranges_clash(port, len, dev->base, 6)
         || (dev->rtc_active && pm_ranges_clash(port, len, PM_RTC_PORT, PM_RTC_SIZE))
-        || (dev->adlib_active && pm_ranges_clash(port, len, PM_ADLIB_PORT, 2))
+        || (dev->adlib_active && pm_ranges_clash(port, len, PM_ADLIB_PORT, PM_OPL_PORTS(dev)))
         || ((dev->cms_port != self) && pm_ranges_clash(port, len, dev->cms_port, PM_CMS_SIZE))
         || ((dev->tandy_port != self) && pm_ranges_clash(port, len, dev->tandy_port, PM_TANDY_SIZE))
         || ((dev->mmb_port != self) && pm_ranges_clash(port, len, dev->mmb_port, PM_MMB_SIZE))
@@ -1269,7 +1554,8 @@ pm_port_used(picomem_t *dev, uint16_t port, int len, uint16_t self)
         || ((dev->sb_port != self) && pm_ranges_clash(port, len, dev->sb_port, PM_SB_SIZE))
         || ((dev->gus_port != self) && pm_ranges_clash(port, len, dev->gus_port, PM_GUS_SIZE))
         || ((dev->gus_port != self) && dev->gus_port && pm_ranges_clash(port, len, dev->gus_port + 0x100, 8))
-        || ((dev->mpu_port != self) && pm_ranges_clash(port, len, dev->mpu_port, PM_MPU_SIZE));
+        || ((dev->mpu_port != self) && pm_ranges_clash(port, len, dev->mpu_port, PM_MPU_SIZE))
+        || pm_ranges_clash(port, len, pm_ne2k_port(), PM_NE2K_SIZE);
 }
 
 /* For each card: 0 = off, 1 = default port, otherwise the port. Returns 0 if OK. */
@@ -1400,12 +1686,18 @@ pm_sb_set_irq_dma(picomem_t *dev, uint8_t irq, uint8_t dma)
 static void
 pm_sb_opl_handlers(picomem_t *dev, uint16_t port, int on)
 {
-    if (on)
+    if (on) {
         io_sethandler(port + 8, 2,
                       dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
-    else
+        /* OPL3 bank 2. Write only: reads of +A belong to the DSP. */
+        if (dev->model == 2)
+            io_sethandler(port + 0x0a, 2, NULL, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+    } else {
         io_removehandler(port + 8, 2,
                          dev->opl.read, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+        if (dev->model == 2)
+            io_removehandler(port + 0x0a, 2, NULL, NULL, NULL, dev->opl.write, NULL, NULL, dev->opl.priv);
+    }
 }
 
 static uint8_t
@@ -1577,6 +1869,59 @@ pm_cfg_word(picomem_t *dev, int offs)
     const uint8_t *cfg = pm_cfg(dev);
 
     return cfg[offs] | (cfg[offs + 1] << 8);
+}
+
+/* CMD_DEV_Init. In the firmware's port table the NE2000 is set up last and wins. */
+static void
+pm_ne2k_setup(picomem_t *dev)
+{
+    uint8_t *cfg  = pm_cfg(dev);
+    uint16_t port = pm_cfg_word(dev, CFG_NE2000_PORT);
+
+    if (pm_ne2k == NULL)
+        return;
+
+    if (port >= 0x3e0) {
+        port = 0;
+        cfg[CFG_NE2000_PORT] = cfg[CFG_NE2000_PORT + 1] = 0;
+    }
+
+    if (port) {
+        if (dev->adlib_active && pm_ranges_clash(port, PM_NE2K_SIZE, PM_ADLIB_PORT, PM_OPL_PORTS(dev)))
+            pm_adlib_enable(dev, 0);
+        if (pm_ranges_clash(port, PM_NE2K_SIZE, dev->cms_port, PM_CMS_SIZE))
+            pm_cms_enable(dev, 0);
+        if (pm_ranges_clash(port, PM_NE2K_SIZE, dev->tandy_port, PM_TANDY_SIZE))
+            pm_tandy_enable(dev, 0);
+        if (pm_ranges_clash(port, PM_NE2K_SIZE, dev->mmb_port, PM_MMB_SIZE))
+            pm_mmb_enable(dev, 0);
+        if (pm_ranges_clash(port, PM_NE2K_SIZE, dev->cvx_port, PM_CVX_SIZE))
+            pm_cvx_enable(dev, 0, 0);
+        if (pm_ranges_clash(port, PM_NE2K_SIZE, dev->mpu_port, PM_MPU_SIZE))
+            pm_mpu_enable(dev, 0);
+    }
+
+    if ((port != pm_ne2k->port) || (cfg[CFG_NE2000_IRQ] != pm_ne2k->irq))
+        pm_ne2k_map(pm_ne2k, port, cfg[CFG_NE2000_IRQ]);
+}
+
+/* wifi_infos_t, shown by the BIOS at offsets 6 (SSID) and 102 (status). */
+static void
+pm_ne2k_infos(picomem_t *dev)
+{
+    uint8_t *p = &dev->ram[PCCR_PARAM];
+
+    memset(p, 0x00, 144);
+    if (pm_ne2k == NULL)
+        return;
+
+    memcpy(p, pm_ne2k->dp8390->physaddr, 6);
+    strcpy((char *) &p[6], "86Box");
+    strcpy((char *) &p[102], " Connected");
+    p[134] = 3;    /* CYW43_LINK_UP */
+    p[136] = 0xd8; /* RSSI -40 */
+    p[137] = p[138] = p[139] = 0xff;
+    p[142] = 1;
 }
 
 /* PM_Audio_OnOff: the master switch applies the per-card settings. */
@@ -2476,13 +2821,12 @@ pm_exec_cmd(picomem_t *dev)
             if (pm_cfg(dev)[CFG_USE_RTC] && pm_ranges_clash(PM_RTC_PORT, PM_RTC_SIZE, dev->tandy_port, PM_TANDY_SIZE))
                 pm_tandy_enable(dev, 0);
             pm_rtc_enable(dev, pm_cfg(dev)[CFG_USE_RTC]);
-            /* TODO: (re)install NE2000, audio, RTC, joystick from config. */
+            pm_ne2k_setup(dev);
             pm_pc_send(dev, PCC_EndCommand); /* PC_End() */
             break;
 
         case CMD_TDY_Init:
-            /* TODO: Tandy conventional RAM extension. */
-            picomem_log("PicoMEM: Tandy RAM init not implemented\n");
+            pm_tandy_ram_init(dev);
             pm_set_status(dev, STAT_READY);
             break;
 
@@ -2563,6 +2907,7 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_Wifi_Infos:
+            pm_ne2k_infos(dev);
             pm_set_status(dev, STAT_READY);
             break;
 
@@ -2630,20 +2975,20 @@ pm_exec_cmd(picomem_t *dev)
             break;
 
         case CMD_SetGUSIRQDMA:
-            dev->data_l = pm_gus_set_irq_dma(dev, dev->data_l, dev->data_h);
+            dev->data_l = PM_HAS_GUS_MPU(dev) ? pm_gus_set_irq_dma(dev, dev->data_l, dev->data_h) : 1;
             dev->data_h = 0;
             pm_set_status(dev, STAT_READY);
             break;
 
         case CMD_GUSOnOff:
-            dev->data_l = pm_gus_enable(dev, (dev->data_h << 8) | dev->data_l);
+            dev->data_l = PM_HAS_GUS_MPU(dev) ? pm_gus_enable(dev, (dev->data_h << 8) | dev->data_l) : 1;
             dev->data_h = 0;
             pm_set_status(dev, STAT_READY);
             break;
 
         case CMD_MPUOnOff:
             /* Low 10 bits: port or 0/1. Top 6 bits: a type the firmware ignores. */
-            dev->data_l = pm_mpu_enable(dev, ((dev->data_h & 0x03) << 8) | dev->data_l);
+            dev->data_l = PM_HAS_GUS_MPU(dev) ? pm_mpu_enable(dev, ((dev->data_h & 0x03) << 8) | dev->data_l) : 1;
             pm_set_status(dev, STAT_READY);
             break;
 
@@ -2808,11 +3153,11 @@ pm_init_shared_ram(picomem_t *dev)
     dev->ram[BV_USBInit]   = pm_mouse_selected() ? INIT_DONE : INIT_DISABLED;
     dev->ram[BV_USBDevice] = pm_mouse_selected() ? 0x01 : 0x00;
     dev->ram[BV_CFGInit]   = cfg_loaded ? INIT_DONE : 0xfd;
-    dev->ram[BV_WifiInit]  = INIT_DISABLED;
+    dev->ram[BV_WifiInit]  = pm_ne2k_selected() ? INIT_DONE : INIT_DISABLED;
     dev->ram[BV_PortInit]  = 0;
     dev->ram[BV_IRQ]       = 0;
-    dev->ram[BV_Tandy]     = 0;
-    dev->ram[BV_TdyRAM]    = 0;
+    dev->ram[BV_Tandy]     = (dev->tandy_ram != 0);
+    dev->ram[BV_TdyRAM]    = (dev->tandy_ram > 1) ? (dev->tandy_ram / 16) : 0;
     dev->ram[BV_BoardID]   = (dev->model == 2) ? BOARD_ID_PM2 : BOARD_ID_PM1;
 
     /* Values forced by the firmware after loading the config. */
@@ -2820,8 +3165,10 @@ pm_init_shared_ram(picomem_t *dev)
     cfg[CFG_BIOSBOOT]    = 0;
     cfg[CFG_B_MAX_PMRAM] = dev->max_pmram;
     cfg[CFG_ENABLE_USB]  = 1;
-    cfg[CFG_ENABLE_WIFI] = 0;
-    cfg[CFG_NE2000_PORT] = cfg[CFG_NE2000_PORT + 1] = 0;
+    if (!pm_ne2k_selected()) {
+        cfg[CFG_ENABLE_WIFI] = 0;
+        cfg[CFG_NE2000_PORT] = cfg[CFG_NE2000_PORT + 1] = 0;
+    }
 }
 
 static void
@@ -2853,6 +3200,7 @@ picomem_init(const device_t *info)
     dev->base      = 0x2a0; /* Fixed on real hardware. */
     dev->bios_addr = device_get_config_hex20("bios_addr");
     dev->irq       = device_get_config_int("irq");
+    dev->tandy_ram = device_get_config_int("tandy_ram");
 
     dev->max_pmram  = (dev->model == 2) ? 16 : 8;
     dev->pmram_size = (uint32_t) dev->max_pmram << 14;
@@ -2914,7 +3262,7 @@ picomem_init(const device_t *info)
 
     pm_set_status(dev, STAT_READY);
 
-    fm_driver_get(FM_YM3812, &dev->opl);
+    fm_driver_get((dev->model == 2) ? FM_YMF262 : FM_YM3812, &dev->opl);
     music_add_handler(pm_music_buffer, dev);
     sn76489_init(&dev->tandy, 0, 0, SN76496, 3579545);
     pm_tandy_silence(dev);
@@ -2923,7 +3271,8 @@ picomem_init(const device_t *info)
     sb_dsp_init(&dev->sb_dsp, SB_DSP_201, SB_SUBTYPE_DEFAULT, dev);
     dev->sb_irq = 7;
     dev->sb_dma = 1;
-    dev->gus    = gus_embedded_init();
+    if (PM_HAS_GUS_MPU(dev))
+        dev->gus = gus_embedded_init();
     sound_add_handler(pm_sound_buffer, dev);
 
     /* The game port stays unmapped until the setup or PMINIT turns it on. */
@@ -2960,10 +3309,13 @@ picomem_close(void *priv)
     pm_sb_enable(dev, 0);
     sb_dsp_close(&dev->sb_dsp);
     pm_gus_enable(dev, 0);
-    gus_close(dev->gus);
+    if (dev->gus)
+        gus_close(dev->gus);
     if (dev->mpu_port) /* The MIDI output may already be closed. */
         io_removehandler(dev->mpu_port, PM_MPU_SIZE,
                          pm_mpu_read, NULL, NULL, pm_mpu_write, NULL, NULL, dev);
+    if (pm_ne2k != NULL)
+        pm_ne2k_map(pm_ne2k, 0, 0);
     if (pm_mouse_card == dev)
         pm_mouse_card = NULL;
     free(dev->pmram);
@@ -2977,7 +3329,8 @@ picomem_speed_changed(void *priv)
     picomem_t *dev = (picomem_t *) priv;
 
     sb_dsp_speed_changed(&dev->sb_dsp);
-    gus_speed_changed(dev->gus);
+    if (dev->gus)
+        gus_speed_changed(dev->gus);
 }
 
 static int
@@ -3016,6 +3369,26 @@ picomem2_available(void)
     }
 
 // clang-format off
+#define PICOMEM_TANDY_CONFIG                                            \
+    {                                                                   \
+        .name           = "tandy_ram",                                  \
+        .description    = "Tandy 1000 mode",                            \
+        .type           = CONFIG_SELECTION,                             \
+        .default_string = NULL,                                         \
+        .default_int    = 0,                                            \
+        .file_filter    = NULL,                                         \
+        .spinner        = { 0 },                                        \
+        .selection      = {                                             \
+            { .description = "Off",              .value = 0   },        \
+            { .description = "On, no added RAM", .value = 1   },        \
+            { .description = "On, add 128 KB",   .value = 128 },        \
+            { .description = "On, add 256 KB",   .value = 256 },        \
+            { .description = "On, add 384 KB",   .value = 384 },        \
+            { .description = ""                               }         \
+        },                                                              \
+        .bios           = { { 0 } }                                     \
+    }
+
 static const device_config_t picomem_config[] = {
     PICOMEM_BIOS_ADDR_CONFIG,
     {
@@ -3035,6 +3408,7 @@ static const device_config_t picomem_config[] = {
         },
         .bios           = { { 0 } }
     },
+    PICOMEM_TANDY_CONFIG,
     { .name = "", .description = "", .type = CONFIG_END }
 };
 
@@ -3057,6 +3431,7 @@ static const device_config_t picomem2_config[] = {
         },
         .bios           = { { 0 } }
     },
+    PICOMEM_TANDY_CONFIG,
     { .name = "", .description = "", .type = CONFIG_END }
 };
 // clang-format on
