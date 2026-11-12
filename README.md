@@ -1,3 +1,8 @@
+> **86Box-Pico:** this fork adds emulation of the **PicoMEM**, **PicoMEM 2** and **PicoGUS** ISA cards.
+> Setup instructions are in [PICO.md](PICO.md), and a Windows build is on the [Releases page](https://github.com/orkosoftware/86Box-Pico/releases).
+> This is an unofficial build, not supported by the 86Box team; report problems on this fork's Issues page.
+> The rest of this README is 86Box's own.
+
 (We need help in developing this emulator! See https://github.com/86Box/86Box/issues/7386 for details. Any and all help is appreciated.)
 
 86Box
